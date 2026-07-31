@@ -3,14 +3,23 @@ numpy
 scipy
 matplotlib
 pandas
+seaborn
 
-# ML detector (CNN+LSTM)
+# ML detector (CNN Autoencoder — see docs/DECISIONS.md, architecture is settled, not CNN+LSTM)
 tensorflow>=2.15
+scikit-learn
 
 # PQC (CRYSTALS-Dilithium) — see docs/PQC_SETUP.md before installing.
 # python-oqs wraps the liboqs C library; you must build liboqs FIRST,
 # then pip install this. It will fail otherwise.
 liboqs-python
+
+# Dashboard
+streamlit
+plotly
+
+# Monitoring (Grafana needs this exporter as its data source, see monitoring/)
+prometheus_client
 
 # Dev / testing
 pytest

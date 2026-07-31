@@ -26,6 +26,24 @@ not cover.
 Alternative rejected: keep broad claim and argue it's "different enough" —
 too risky under adversarial questioning.
 
+**2026-07 — Detector architecture locked to CNN Autoencoder (not CNN+LSTM)**
+Why: deck had inconsistent naming across slides (Methodology + Expected
+Outcomes deliverables said "CNN Autoencoder"; Novelty + Expected Outcomes
+metrics table said "CNN+LSTM"). Team decision: CNN Autoencoder only.
+Action item: fix slides 8 and 12 to match — currently still say CNN+LSTM.
+Alternative rejected: hybrid CNN+LSTM autoencoder — more architecturally
+complex, not worth the added risk for the accuracy gain it might give.
+
+**2026-07 — Adaptive attacker implemented, detector evaluated against it**
+Why: deck claimed "Adaptive ML Detection" detects the adaptive attacker,
+but this wasn't actually implemented or tested — an overclaim. Built both
+NonAdaptiveAttacker (fixed perturbation, baseline) and AdaptiveAttacker
+(sqrt-law-bounded, interference-shaped) in covert_channel/attacker.py, so
+the detector's performance against each can be measured and reported
+separately. Do not claim "detects adaptive attacks" until there's an
+actual ROC/AUC number against AdaptiveAttacker output — smoke test alone
+(5 epochs, 30 samples) showed 10%/10%, i.e. no discrimination yet.
+
 ---
 
 Add new entries above this line. Keep each entry under 5 lines — if you

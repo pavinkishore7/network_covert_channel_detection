@@ -24,12 +24,38 @@ asks "isn't this already done."
 ## Repo structure
 ```
 slicing_sim/      Network slicing + OFDM resource allocation simulation
-covert_channel/   Attacker module: interference-shaped covert channel (bounded by sqrt-law)
-detector/         CNN+LSTM anomaly detector (TensorFlow/Keras)
-pqc_auth/         CRYSTALS-Dilithium signing + dual-trigger re-auth logic
+covert_channel/   NonAdaptiveAttacker (baseline) + AdaptiveAttacker (sqrt-law-bounded, shaped)
+detector/         CNN Autoencoder anomaly detector (TensorFlow/Keras) — see docs/DECISIONS.md
+pqc_auth/         CRYSTALS-Dilithium signing + dual-trigger re-auth logic (not yet implemented)
+dashboard/        Streamlit app — visualizes sim/attacker output live
+monitoring/       Prometheus exporter + Grafana provisioning (untested end-to-end, see below)
 results/          Output plots, CSVs, benchmark numbers — versioned, not overwritten
 docs/             Design decisions, setup guides, meeting notes
-tests/            pytest unit tests
+tests/            pytest unit tests (not yet written)
+```
+
+## What's actually implemented vs. still a stub
+- **Working, smoke-tested:** `slicing_sim/ofdm_grid.py`, `covert_channel/attacker.py`
+  (both non-adaptive and adaptive), `detector/cnn_autoencoder.py` (architecture
+  runs end-to-end; not trained on real data volume yet), `dashboard/app.py`.
+- **Written but NOT run end-to-end:** `docker-compose.yml`, `monitoring/exporter.py`
+  inside Docker, Grafana provisioning. No Docker available in the environment
+  this was built in — test locally before relying on it for a demo.
+- **Not started:** `pqc_auth/` (CRYSTALS-Dilithium signing, dual-trigger re-auth
+  logic), `tests/`.
+
+## Running the dashboard locally
+```bash
+pip install -r requirements.txt
+streamlit run dashboard/app.py
+```
+
+## Running the full monitoring stack (Docker, untested by me — verify it works)
+```bash
+docker-compose up --build
+# Streamlit:   http://localhost:8501
+# Prometheus:  http://localhost:9090
+# Grafana:     http://localhost:3000  (anonymous viewer access enabled)
 ```
 
 ## Setup
