@@ -1,0 +1,17 @@
+# Simulation / general
+numpy
+scipy
+matplotlib
+pandas
+
+# ML detector (CNN+LSTM)
+tensorflow>=2.15
+
+# PQC (CRYSTALS-Dilithium) — see docs/PQC_SETUP.md before installing.
+# python-oqs wraps the liboqs C library; you must build liboqs FIRST,
+# then pip install this. It will fail otherwise.
+liboqs-python
+
+# Dev / testing
+pytest
+jupyter
