@@ -19,3 +19,4 @@ Thumbs.db
 *.log
 *.h5
 *.ckpt
+results/*.npy
