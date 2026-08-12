@@ -34,7 +34,7 @@ class CNNAutoencoderDetector:
         self.latent_dim = latent_dim
         self.model = self._build_model()
         self.threshold_: float | None = None  # set by calibrate()
-
+        self.mode_: str = "mean"
     def _build_model(self) -> keras.Model:
         h, w = self.input_shape
         inp = keras.Input(shape=(h, w, 1))
@@ -77,26 +77,44 @@ class CNNAutoencoderDetector:
                                   validation_split=0.1, verbose=verbose)
         return history
 
-    def reconstruction_error(self, grids: np.ndarray) -> np.ndarray:
-        """Per-sample MSE reconstruction error. Higher = more anomalous."""
+   def reconstruction_error(self, grids: np.ndarray, mode: str = "mean") -> np.ndarray:
+        """mode='mean': original full-grid MSE (diluted by sparse attacks).
+        mode='max': per-cell squared error, max over grid — sensitive to
+        sparse, localized anomalies even if only ~30 cells are touched.
+        mode='topk': mean of top 1% highest-error cells — more robust than
+        max, still sensitive to sparse localized perturbation."""
         x = self._prep(grids)
         recon = self.model.predict(x, verbose=0)
-        return np.mean((x - recon) ** 2, axis=(1, 2, 3))
+        sq_err = (x - recon) ** 2
+        if mode == "mean":
+            return np.mean(sq_err, axis=(1, 2, 3))
+        elif mode == "max":
+            return np.max(sq_err, axis=(1, 2, 3))
+        elif mode == "topk":
+            flat = sq_err.reshape(sq_err.shape[0], -1)
+            k = max(1, int(0.01 * flat.shape[1]))
+            topk = np.partition(flat, -k, axis=1)[:, -k:]
+            return topk.mean(axis=1)
+        else:
+            raise ValueError(f"unknown mode: {mode}")
 
-    def calibrate(self, clean_val_grids: np.ndarray, percentile: float = 95.0):
+    def calibrate(self, clean_val_grids: np.ndarray, percentile: float = 95.0,
+                  mode: str = "mean"):
         """Set detection threshold from the tail of the CLEAN validation
-        error distribution. percentile=95 means ~5% false-alarm rate on
-        clean data BY CONSTRUCTION — report this alongside any detection
-        accuracy number, don't quote accuracy without the FPR it was
-        calibrated at."""
-        errors = self.reconstruction_error(clean_val_grids)
+        error distribution, using the same mode that will be used at
+        inference. percentile=95 means ~5% false-alarm rate on clean data
+        BY CONSTRUCTION — report this alongside any detection accuracy
+        number, don't quote accuracy without the FPR it was calibrated
+        at."""
+        errors = self.reconstruction_error(clean_val_grids, mode=mode)
         self.threshold_ = float(np.percentile(errors, percentile))
+        self.mode_ = mode
         return self.threshold_
 
     def predict_anomaly(self, grids: np.ndarray) -> np.ndarray:
         if self.threshold_ is None:
             raise RuntimeError("Call calibrate() before predict_anomaly().")
-        return self.reconstruction_error(grids) > self.threshold_
+        return self.reconstruction_error(grids, mode=self.mode_) > self.threshold_
 
 
 if __name__ == "__main__":
