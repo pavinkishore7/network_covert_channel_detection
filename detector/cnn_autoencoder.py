@@ -34,14 +34,19 @@ class CNNAutoencoderDetector:
         self.latent_dim = latent_dim
         self.model = self._build_model()
         self.threshold_: float | None = None  # set by calibrate()
-        self.mode_: str = "mean"
+        self.mode_: str = "mean"  # set by calibrate(), used by predict_anomaly()
+        # Fixed normalization from clean training data — never recomputed
+        # per batch (doing so would absorb variance-shift attacks into the
+        # normalizer and hide them from reconstruction error).
+        self.mu_: float | None = None
+        self.sigma_: float | None = None
+
     def _build_model(self) -> keras.Model:
         h, w = self.input_shape
         inp = keras.Input(shape=(h, w, 1))
 
         # Encoder
         x = layers.Conv2D(16, 3, activation="relu", padding="same")(inp)
-        x = layers.MaxPooling2D(2, padding="same")(x)
         x = layers.Conv2D(8, 3, activation="relu", padding="same")(x)
         x = layers.MaxPooling2D(2, padding="same")(x)
         encoded_shape = x.shape[1:]  # remember for decoder upsampling
@@ -62,22 +67,29 @@ class CNNAutoencoderDetector:
         model.compile(optimizer="adam", loss="mse")
         return model
 
-    @staticmethod
-    def _prep(grids: np.ndarray) -> np.ndarray:
-        """grids: (N, n_symbols, n_subcarriers) -> normalized (N, h, w, 1)."""
+    def _prep(self, grids: np.ndarray) -> np.ndarray:
+        """grids: (N, n_symbols, n_subcarriers) -> normalized (N, h, w, 1).
+
+        Always uses mu_/sigma_ locked in during fit() on clean training data.
+        """
+        if self.mu_ is None or self.sigma_ is None:
+            raise RuntimeError("Call fit() before using the detector — "
+                               "normalization stats come from clean training data.")
         x = grids.astype("float32")
-        mu, sigma = x.mean(), x.std() + 1e-8
-        x = (x - mu) / sigma
+        x = (x - self.mu_) / self.sigma_
         return x[..., np.newaxis]
 
     def fit(self, clean_grids: np.ndarray, epochs: int = 20, batch_size: int = 8, verbose: int = 0):
         """Train ONLY on clean (non-attacked) grids."""
+        x_raw = clean_grids.astype("float32")
+        self.mu_ = float(x_raw.mean())
+        self.sigma_ = float(x_raw.std() + 1e-8)
         x = self._prep(clean_grids)
         history = self.model.fit(x, x, epochs=epochs, batch_size=batch_size,
                                   validation_split=0.1, verbose=verbose)
         return history
 
-   def reconstruction_error(self, grids: np.ndarray, mode: str = "mean") -> np.ndarray:
+    def reconstruction_error(self, grids: np.ndarray, mode: str = "mean") -> np.ndarray:
         """mode='mean': original full-grid MSE (diluted by sparse attacks).
         mode='max': per-cell squared error, max over grid — sensitive to
         sparse, localized anomalies even if only ~30 cells are touched.
