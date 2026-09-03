@@ -34,6 +34,8 @@ class CNNAutoencoderDetector:
         self.latent_dim = latent_dim
         self.model = self._build_model()
         self.threshold_: float | None = None  # set by calibrate()
+        self.mu_: float | None = None
+        self.sigma_: float | None = None
 
     def _build_model(self) -> keras.Model:
         h, w = self.input_shape
@@ -62,16 +64,18 @@ class CNNAutoencoderDetector:
         model.compile(optimizer="adam", loss="mse")
         return model
 
-    @staticmethod
-    def _prep(grids: np.ndarray) -> np.ndarray:
-        """grids: (N, n_symbols, n_subcarriers) -> normalized (N, h, w, 1)."""
-        x = grids.astype("float32")
-        mu, sigma = x.mean(), x.std() + 1e-8
-        x = (x - mu) / sigma
+    def _prep(self, grids: np.ndarray) -> np.ndarray:
+        """Normalize grids with the clean-training statistics locked by ``fit``."""
+        if self.mu_ is None or self.sigma_ is None:
+            raise RuntimeError("Call fit() before preparing data for detection.")
+        x = (grids.astype("float32") - self.mu_) / self.sigma_
         return x[..., np.newaxis]
 
     def fit(self, clean_grids: np.ndarray, epochs: int = 20, batch_size: int = 8, verbose: int = 0):
-        """Train ONLY on clean (non-attacked) grids."""
+        """Train ONLY on clean (non-attacked) grids and lock their scale."""
+        clean_grids = clean_grids.astype("float32")
+        self.mu_ = float(clean_grids.mean())
+        self.sigma_ = float(clean_grids.std() + 1e-8)
         x = self._prep(clean_grids)
         history = self.model.fit(x, x, epochs=epochs, batch_size=batch_size,
                                   validation_split=0.1, verbose=verbose)

@@ -1,96 +1,126 @@
 """
-CNN Autoencoder for covert-channel detection — normalization fix.
+Network slicing + OFDM resource-grid simulation.
 
-BUG FIXED: the original _prep() recomputed mu/sigma from whatever array
-was passed to it, on every call. This meant test/attack data was being
-normalized using statistics derived from itself, silently erasing any
-anomaly that expressed itself as a shift in the grid's global mean or
-variance -- exactly the kind of anomaly an attacker optimizing to match
-the legitimate interference distribution would produce. Fix: compute
-mu/sigma ONCE from clean training data in fit(), store them, and reuse
-those locked values in every subsequent call to _prep().
+Produces a per-slice OFDM resource allocation over time: which subcarriers
+are active, their power/interference levels, per symbol, per slice.
+This resource grid is the shared object that:
+  - covert_channel.attacker perturbs (to hide a covert signal in it)
+  - detector.cnn_autoencoder learns the "normal" distribution of
+
+Slice types modeled: URLLC, eMBB, mMTC — each with different subcarrier
+allocation patterns and timing tolerances (used later for the slice-aware
+re-auth timer intervals).
 """
 
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+from dataclasses import dataclass, field
 
 
-class CNNAutoencoderDetector:
-    def __init__(self, input_shape: tuple[int, int], latent_dim: int = 16):
-        self.input_shape = input_shape
-        self.latent_dim = latent_dim
-        self.model = self._build_model()
-        self.threshold_: float | None = None
-        self.mu_: float | None = None       # locked at fit() time
-        self.sigma_: float | None = None    # locked at fit() time
+SLICE_TYPES = ("URLLC", "eMBB", "mMTC")
 
-    def _build_model(self) -> keras.Model:
-        h, w = self.input_shape
-        inp = keras.Input(shape=(h, w, 1))
+# Rough per-slice-type profile: fraction of subcarriers typically allocated,
+# and how "bursty" vs steady the traffic is. These are design assumptions
+# for simulation purposes, NOT measured values — state this plainly if asked.
+SLICE_PROFILES = {
+    "URLLC": {"subcarrier_frac": 0.15, "burstiness": 0.2},   # small, steady, latency-critical
+    "eMBB":  {"subcarrier_frac": 0.55, "burstiness": 0.5},   # large, bursty, throughput-driven
+    "mMTC":  {"subcarrier_frac": 0.30, "burstiness": 0.8},   # many small sporadic bursts
+}
 
-        x = layers.Conv2D(16, 3, activation="relu", padding="same")(inp)
-        x = layers.MaxPooling2D(2, padding="same")(x)
-        x = layers.Conv2D(8, 3, activation="relu", padding="same")(x)
-        x = layers.MaxPooling2D(2, padding="same")(x)
-        encoded_shape = x.shape[1:]
-        x = layers.Flatten()(x)
-        latent = layers.Dense(self.latent_dim, activation="relu", name="latent")(x)
 
-        flat_units = int(np.prod(encoded_shape))
-        x = layers.Dense(flat_units, activation="relu")(latent)
-        x = layers.Reshape(encoded_shape)(x)
-        x = layers.Conv2DTranspose(8, 3, strides=2, activation="relu", padding="same")(x)
-        x = layers.Conv2DTranspose(16, 3, strides=2, activation="relu", padding="same")(x)
-        x = layers.Resizing(h, w)(x)
-        out = layers.Conv2D(1, 3, activation="linear", padding="same")(x)
+@dataclass
+class OFDMGridConfig:
+    n_subcarriers: int = 64
+    n_symbols: int = 200          # time steps (OFDM symbols) per simulation run
+    snr_db: float = 20.0
+    seed: int | None = None
 
-        model = keras.Model(inp, out, name="cnn_autoencoder_detector")
-        model.compile(optimizer="adam", loss="mse")
-        return model
 
-    def _prep(self, grids: np.ndarray) -> np.ndarray:
-        """grids: (N, n_symbols, n_subcarriers) -> normalized (N, h, w, 1).
+@dataclass
+class SliceAllocation:
+    slice_type: str
+    subcarrier_mask: np.ndarray   # (n_symbols, n_subcarriers) bool — which subcarriers this slice owns per symbol
+    power: np.ndarray             # (n_symbols, n_subcarriers) float — allocated power where mask is True
 
-        Uses self.mu_/self.sigma_ locked during fit(). Raises if called
-        before fit() -- there is no such thing as a sensible default that
-        silently falls back to per-call stats, because that IS the bug.
+
+class NetworkSlicingSimulator:
+    """Generates a shared OFDM resource grid partitioned across slices."""
+
+    def __init__(self, config: OFDMGridConfig):
+        self.cfg = config
+        self.rng = np.random.default_rng(config.seed)
+
+    def allocate_slices(self) -> dict[str, SliceAllocation]:
+        """Partition subcarriers across the three slice types per symbol.
+
+        Non-overlapping allocation per symbol (logical isolation assumption —
+        the covert channel exploits INTERFERENCE LEAKAGE across this boundary,
+        not the allocation logic itself).
         """
-        if self.mu_ is None or self.sigma_ is None:
-            raise RuntimeError(
-                "Normalization stats not locked yet. Call fit() on clean "
-                "training data before _prep()/reconstruction_error()."
-            )
-        x = grids.astype("float32")
-        x = (x - self.mu_) / self.sigma_
-        return x[..., np.newaxis]
+        n_sub = self.cfg.n_subcarriers
+        n_sym = self.cfg.n_symbols
+        allocations = {}
 
-    def fit(self, clean_grids: np.ndarray, epochs: int = 20, batch_size: int = 8, verbose: int = 0):
-        """Train ONLY on clean (non-attacked) grids. Locks mu_/sigma_ here,
-        from this data, once, before any training or evaluation happens."""
-        clean_grids = clean_grids.astype("float32")
-        self.mu_ = float(clean_grids.mean())
-        self.sigma_ = float(clean_grids.std() + 1e-8)
+        for slice_type in SLICE_TYPES:
+            profile = SLICE_PROFILES[slice_type]
+            mask = np.zeros((n_sym, n_sub), dtype=bool)
+            power = np.zeros((n_sym, n_sub), dtype=float)
 
-        x = self._prep(clean_grids)
-        history = self.model.fit(x, x, epochs=epochs, batch_size=batch_size,
-                                  validation_split=0.1, verbose=verbose)
-        return history
+            n_active = max(1, int(profile["subcarrier_frac"] * n_sub))
+            for t in range(n_sym):
+                # burstiness controls how much the active set changes symbol to symbol
+                if t == 0 or self.rng.random() < profile["burstiness"]:
+                    active_idx = self.rng.choice(n_sub, size=n_active, replace=False)
+                else:
+                    active_idx = np.where(mask[t - 1])[0]
+                mask[t, active_idx] = True
+                power[t, active_idx] = self.rng.uniform(0.8, 1.0, size=len(active_idx))
 
-    def reconstruction_error(self, grids: np.ndarray) -> np.ndarray:
-        """Per-sample MSE reconstruction error, using LOCKED normalization
-        stats from training -- not stats derived from `grids` itself."""
-        x = self._prep(grids)
-        recon = self.model.predict(x, verbose=0)
-        return np.mean((x - recon) ** 2, axis=(1, 2, 3))
+            allocations[slice_type] = SliceAllocation(slice_type, mask, power)
 
-    def calibrate(self, clean_val_grids: np.ndarray, percentile: float = 95.0):
-        errors = self.reconstruction_error(clean_val_grids)
-        self.threshold_ = float(np.percentile(errors, percentile))
-        return self.threshold_
+        return self._resolve_conflicts(allocations)
 
-    def predict_anomaly(self, grids: np.ndarray) -> np.ndarray:
-        if self.threshold_ is None:
-            raise RuntimeError("Call calibrate() before predict_anomaly().")
-        return self.reconstruction_error(grids) > self.threshold_
+    def _resolve_conflicts(self, allocations: dict[str, SliceAllocation]) -> dict[str, SliceAllocation]:
+        """Ensure no two slices claim the same subcarrier in the same symbol
+        (logical isolation). Conflicts are resolved by priority: URLLC > eMBB > mMTC.
+        """
+        priority = ["URLLC", "eMBB", "mMTC"]
+        claimed = np.zeros((self.cfg.n_symbols, self.cfg.n_subcarriers), dtype=bool)
+
+        for slice_type in priority:
+            alloc = allocations[slice_type]
+            conflict = alloc.subcarrier_mask & claimed
+            alloc.subcarrier_mask[conflict] = False
+            alloc.power[conflict] = 0.0
+            claimed |= alloc.subcarrier_mask
+
+        return allocations
+
+    def add_awgn(self, power_grid: np.ndarray) -> np.ndarray:
+        """Apply AWGN at the configured SNR. This is where the AWGN-specificity
+        caveat lives: real multipath channels aren't modeled here."""
+        signal_power = np.mean(power_grid[power_grid > 0]) if np.any(power_grid > 0) else 1.0
+        snr_linear = 10 ** (self.cfg.snr_db / 10)
+        noise_power = signal_power / snr_linear
+        noise = self.rng.normal(0, np.sqrt(noise_power), size=power_grid.shape)
+        return power_grid + noise
+
+    def combined_interference_grid(self, allocations: dict[str, SliceAllocation]) -> np.ndarray:
+        """Sum of all slices' power allocation, i.e. what a receiver observing
+        the shared spectrum actually sees — the substrate the covert channel
+        rides on top of."""
+        total = np.zeros((self.cfg.n_symbols, self.cfg.n_subcarriers))
+        for alloc in allocations.values():
+            total += alloc.power
+        return self.add_awgn(total)
+
+
+if __name__ == "__main__":
+    cfg = OFDMGridConfig(seed=42)
+    sim = NetworkSlicingSimulator(cfg)
+    allocations = sim.allocate_slices()
+    grid = sim.combined_interference_grid(allocations)
+    print(f"Grid shape: {grid.shape}")
+    for slice_type, alloc in allocations.items():
+        occ = alloc.subcarrier_mask.mean()
+        print(f"{slice_type}: mean subcarrier occupancy = {occ:.2%}")
