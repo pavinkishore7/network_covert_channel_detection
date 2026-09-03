@@ -81,7 +81,7 @@ class AdaptiveAttacker:
     def generate_covert_bits(self) -> np.ndarray:
         return self.rng.integers(0, 2, size=self.cfg.n_covert_bits)
 
-    def sqrt_law_magnitude(self, n_channel_uses: int, base_magnitude: float = 2.0) -> float:
+    def sqrt_law_magnitude(self, n_channel_uses: int, base_magnitude: float = 40.0) -> float:
         """Per-symbol perturbation magnitude scaled so cumulative detectability
         stays bounded as channel uses grow — magnitude ~ 1/sqrt(n) per use,
         giving O(sqrt(n)) total covert information, per the sqrt-law."""
@@ -100,7 +100,11 @@ class AdaptiveAttacker:
         if len(target_idx) == 0:
             return grid
 
-        n_channel_uses = len(target_idx)
+        # ``n`` in the square-root law is the number of channel uses that
+        # actually carry covert symbols, not every allocated resource element.
+        # Using the full mask previously understated the adaptive signal by
+        # treating untouched cells as transmissions.
+        n_channel_uses = min(len(bits), len(target_idx))
         magnitude = self.sqrt_law_magnitude(n_channel_uses)
 
         # local noise scale: perturbation should be comparable to, not
@@ -114,6 +118,44 @@ class AdaptiveAttacker:
             grid[t, f] += shaped if bits[i] else -shaped
 
         return grid
+
+
+class ReactiveJammer:
+    """Defensive simulation of an energy-aware reactive partial-band jammer.
+
+    It transmits only when observed slice power crosses a threshold, modelling
+    a common availability threat without interacting with any real radio.
+    """
+
+    def __init__(self, seed: int | None = None, duty_cycle: float = 0.15):
+        self.rng = np.random.default_rng(seed)
+        self.duty_cycle = duty_cycle
+
+    def inject(self, grid: np.ndarray, target_mask: np.ndarray) -> np.ndarray:
+        result = grid.copy()
+        active = target_mask & (grid > np.quantile(grid[target_mask], 0.7))
+        candidates = np.argwhere(active)
+        count = int(len(candidates) * self.duty_cycle)
+        if count:
+            selected = candidates[self.rng.choice(len(candidates), count, replace=False)]
+            result[selected[:, 0], selected[:, 1]] += self.rng.normal(0.8, 0.12, size=count)
+        return result
+
+
+class PilotSpoofer:
+    """Defensive model of pilot-resource manipulation / synchronization spoofing."""
+
+    def __init__(self, seed: int | None = None, pilot_period: int = 14):
+        self.rng = np.random.default_rng(seed)
+        self.pilot_period = pilot_period
+
+    def inject(self, grid: np.ndarray, target_mask: np.ndarray) -> np.ndarray:
+        result = grid.copy()
+        pilot_rows = np.arange(0, grid.shape[0], self.pilot_period)
+        pilot_mask = target_mask.copy()
+        pilot_mask[np.setdiff1d(np.arange(grid.shape[0]), pilot_rows)] = False
+        result[pilot_mask] += self.rng.normal(0.35, 0.05, size=int(pilot_mask.sum()))
+        return result
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2 @@
+model,attack,threshold,false_positive_rate,detection_recall,roc_auc,pr_auc,test_clean_samples,test_attack_samples
+linear_convolutional_patch_autoencoder,adaptive,1.69627309,0.066667,0.455556,0.791111,0.809465,90,90

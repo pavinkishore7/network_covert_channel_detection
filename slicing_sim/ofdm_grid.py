@@ -13,6 +13,7 @@ re-auth timer intervals).
 """
 
 import numpy as np
+from slicing_sim.channel import ChannelImpairmentConfig, apply_impairments
 from dataclasses import dataclass, field
 
 
@@ -34,6 +35,7 @@ class OFDMGridConfig:
     n_symbols: int = 200          # time steps (OFDM symbols) per simulation run
     snr_db: float = 20.0
     seed: int | None = None
+    channel: ChannelImpairmentConfig = ChannelImpairmentConfig()
 
 
 @dataclass
@@ -112,7 +114,7 @@ class NetworkSlicingSimulator:
         total = np.zeros((self.cfg.n_symbols, self.cfg.n_subcarriers))
         for alloc in allocations.values():
             total += alloc.power
-        return self.add_awgn(total)
+        return apply_impairments(self.add_awgn(total), self.rng, self.cfg.channel)
 
 
 if __name__ == "__main__":

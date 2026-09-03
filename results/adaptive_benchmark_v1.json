@@ -1,0 +1,23 @@
+{
+  "detector": "AdaptiveResidualDetector",
+  "scope": "OFDM impairment simulation; not a field-performance claim",
+  "split": {
+    "train_clean": 600,
+    "validation_clean": 300,
+    "test_per_class": 300
+  },
+  "snr_db": [
+    8,
+    12,
+    16,
+    20,
+    24
+  ],
+  "channel_profiles": [
+    "awgn",
+    "urban_micro",
+    "high_mobility"
+  ],
+  "threshold_percentile": 99.0,
+  "top_fraction": 0.01
+}

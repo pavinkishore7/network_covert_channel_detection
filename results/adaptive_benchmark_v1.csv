@@ -1,0 +1,3 @@
+attack,threshold,false_positive_rate,detection_recall,roc_auc,pr_auc,test_clean_samples,test_attack_samples
+non_adaptive,3.479676,0.04,0.276667,0.552111,0.628919,300,300
+adaptive,3.479676,0.04,0.63,0.875022,0.860423,300,300

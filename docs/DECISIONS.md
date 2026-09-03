@@ -4,6 +4,14 @@ Format: Date — Decision — Why — Alternatives rejected
 
 ---
 
+**2026-09 — Adaptive residual guard added for reproducible benchmark evaluation**
+Why: TensorFlow CNN experiments are not portable to every reviewer environment,
+and the prior smoke test had no held-out adaptive result. The clean-calibrated
+NumPy guard reports FPR/recall/ROC-AUC/PR-AUC with slice telemetry. It is a
+benchmark guard, not a replacement for the CNN Autoencoder research model.
+
+---
+
 **2026-07 — Dual-trigger re-authentication retained (timer + detector-triggered)**
 Why: removing the timer trigger collapses the architecture into single-layer
 defense (detection-only), which kills the defense-in-depth novelty claim —

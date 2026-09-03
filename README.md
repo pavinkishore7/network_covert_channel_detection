@@ -12,7 +12,8 @@ Supervisor: Mrs. Stella Mercy M.
 
 ## What this is
 Detects OFDM subcarrier-interference-based covert channels crossing
-network slice boundaries, using a CNN+LSTM anomaly detector, backed by
+network slice boundaries, using a CNN Autoencoder research detector and a
+clean-calibrated adaptive residual benchmark guard, backed by an optional
 CRYSTALS-Dilithium post-quantum slice authentication with a dual-trigger
 re-authentication scheme (periodic slice-aware timer + detector-triggered).
 
@@ -26,7 +27,7 @@ asks "isn't this already done."
 slicing_sim/      Network slicing + OFDM resource allocation simulation
 covert_channel/   NonAdaptiveAttacker (baseline) + AdaptiveAttacker (sqrt-law-bounded, shaped)
 detector/         CNN Autoencoder anomaly detector (TensorFlow/Keras) — see docs/DECISIONS.md
-pqc_auth/         CRYSTALS-Dilithium signing + dual-trigger re-auth logic (not yet implemented)
+pqc_auth/         Optional CRYSTALS-Dilithium adapter + dual-trigger re-auth policy
 dashboard/        Streamlit app — visualizes sim/attacker output live
 monitoring/       Prometheus exporter + Grafana provisioning (untested end-to-end, see below)
 results/          Output plots, CSVs, benchmark numbers — versioned, not overwritten
@@ -41,8 +42,16 @@ tests/            pytest unit tests (not yet written)
 - **Written but NOT run end-to-end:** `docker-compose.yml`, `monitoring/exporter.py`
   inside Docker, Grafana provisioning. No Docker available in the environment
   this was built in — test locally before relying on it for a demo.
-- **Not started:** `pqc_auth/` (CRYSTALS-Dilithium signing, dual-trigger re-auth
-  logic), `tests/`.
+- **Policy implemented, crypto runtime optional:** `pqc_auth/` includes the
+  dual-trigger policy and an `oqs` Dilithium adapter. It requires liboqs before
+  signing can run.
+- **Benchmark:** `python -m detector.run_adaptive_benchmark` creates held-out
+  multi-impairment simulation results in `results/adaptive_benchmark_v1.csv`.
+- **PHY slicing benchmark:** `python -m slicing_sim.run_mixed_numerology_benchmark`
+  reports guard-band and cancellation effects on ISBI, SINR and QPSK BER.
+- **CNN-family benchmark:** `python -m detector.run_convolutional_autoencoder_benchmark`
+  runs the CPU-compatible linear convolutional patch autoencoder. The TensorFlow
+  CNN remains a separate architecture requiring its runtime dependency.
 
 ## Running the dashboard locally
 ```bash
@@ -78,6 +87,7 @@ work with a bare `pip install` — there's a C library build step first.
 5. **Design decisions go in `docs/DECISIONS.md`**, not buried in a chat thread. If you argued about something for more than 10 minutes, write down what you decided and why.
 
 ## Known open issues (be honest about these when presenting)
-- CNN autoencoder detection assumes a **non-adaptive attacker** — evasion under the adaptive/interference-shaping attacker model is unresolved.
+- Adaptive-detector metrics are simulation-only and must be reported with their
+  configured false-positive rate; they do not establish field robustness.
 - Square-root law covert-channel bound is derived under **AWGN**; real multipath 5G channels aren't validated yet.
 - Phase 1 = design + simulation only. No empirical detection-accuracy numbers exist yet — don't present projected numbers as measured.

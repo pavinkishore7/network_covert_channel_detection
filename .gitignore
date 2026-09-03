@@ -14,6 +14,7 @@ Thumbs.db
 
 # Env / secrets
 .env
+.python-deps/
 
 # Large generated artifacts (keep results/ CSVs and plots, not raw logs)
 *.log
