@@ -59,22 +59,37 @@ def main() -> None:
     model = StructuredDAE(X.shape[1:], seed=args.seed)
     model.fit(X[train][y[train] == 0], epochs=args.epochs, batch_size=args.batch_size,
               mask_probability=args.mask_probability, verbose=2)
-    threshold = model.calibrate(X[valid][y[valid] == 0], mode="topk", top_fraction=0.01)
+
+    valid_y, valid_snr = y[valid], snr[valid]
+    valid_scores = model.reconstruction_error(X[valid], mode="topk", top_fraction=0.01)
+    thresholds = {}
+    for snr_value in np.unique(valid_snr):
+        clean_valid = valid_scores[(valid_snr == snr_value) & (valid_y == 0)]
+        thresholds[snr_value] = float(np.percentile(clean_valid, 95))
+
     scores = model.reconstruction_error(X[test], mode="topk", top_fraction=0.01)
     test_y, test_snr = y[test], snr[test]
     rows = []
-    for snr_value in ["overall", *np.unique(test_snr).tolist()]:
-        select = np.ones(len(test), dtype=bool) if snr_value == "overall" else test_snr == snr_value
+    for snr_value in np.unique(test_snr):
+        select = test_snr == snr_value
         clean = scores[select & (test_y == 0)]
+        threshold = thresholds[snr_value]
         for label, name in ((1, "non_adaptive"), (2, "adaptive")):
-            row = {"snr": snr_value, "attack": name, **_metrics(clean, scores[select & (test_y == label)], threshold)}
+            attack_scores = scores[select & (test_y == label)]
+            row = {"snr": snr_value, "attack": name, "threshold": threshold,
+                   "n_flagged": int((attack_scores > threshold).sum()), "n_total": int(len(attack_scores)),
+                   "n_fp": int((clean > threshold).sum()), "n_clean": int(len(clean)),
+                   **_metrics(clean, attack_scores, threshold)}
             rows.append(row)
     output = pd.DataFrame(rows)
     output.to_csv(args.results_dir / "structured_dae_results.csv", index=False)
-    np.savez(args.results_dir / "structured_dae_errors.npz", scores=scores, y=test_y, snr=test_snr, threshold=threshold)
+    np.savez(args.results_dir / "structured_dae_errors.npz", scores=scores, y=test_y, snr=test_snr,
+             thresholds=np.array(sorted(thresholds.items())))
     (args.results_dir / "structured_dae_config.json").write_text(json.dumps(vars(args), default=str, indent=2))
     print(output.to_string(index=False))
-    print(f"\nThreshold (clean validation 95th percentile): {threshold:.6f}")
+    print("\nPer-SNR thresholds (clean validation 95th percentile):")
+    for snr_value in sorted(thresholds):
+        print(f"  SNR {snr_value:>3}: {thresholds[snr_value]:.6f}")
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ def build_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
             scenario_seed += 1
 
-    X = np.stack(X_rows).astype(np.float64)
+    X = np.stack(X_rows).astype(np.float32)
     y = np.asarray(y_rows, dtype=np.int64)
     snr = np.asarray(snr_rows, dtype=np.int64)
     return X, y, snr
