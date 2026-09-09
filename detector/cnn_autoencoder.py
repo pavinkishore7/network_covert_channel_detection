@@ -25,13 +25,56 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 
+def _reduce(flat: np.ndarray, mode: str, top_fraction: float) -> np.ndarray:
+    if mode == "mean":
+        return flat.mean(axis=1)
+    if mode == "max":
+        return flat.max(axis=1)
+    if mode == "topk":
+        if not 0 < top_fraction <= 1:
+            raise ValueError("top_fraction must be in (0, 1]")
+        k = max(1, int(top_fraction * flat.shape[1]))
+        return np.partition(flat, -k, axis=1)[:, -k:].mean(axis=1)
+    raise ValueError("mode must be one of: mean, max, topk")
+
+
+def _reduce_1d(vals: np.ndarray, mode: str, top_fraction: float) -> float:
+    if mode == "mean":
+        return float(vals.mean())
+    if mode == "max":
+        return float(vals.max())
+    if mode == "topk":
+        if not 0 < top_fraction <= 1:
+            raise ValueError("top_fraction must be in (0, 1]")
+        k = max(1, int(top_fraction * vals.size))
+        return float(np.partition(vals, -k)[-k:].mean())
+    raise ValueError("mode must be one of: mean, max, topk")
+
+
+def _reduce_masked(sq: np.ndarray, region_mask: np.ndarray, mode: str, top_fraction: float) -> np.ndarray:
+    """sq: (N, H, W) squared error. region_mask: (H, W) or (N, H, W) bool."""
+    region_mask = np.asarray(region_mask, dtype=bool)
+    if region_mask.ndim == 2:
+        region_mask = np.broadcast_to(region_mask, sq.shape)
+    if region_mask.shape != sq.shape:
+        raise ValueError(f"region_mask shape {region_mask.shape} does not match error grid shape {sq.shape}")
+    out = np.empty(len(sq), dtype=np.float64)
+    for i in range(len(sq)):
+        vals = sq[i][region_mask[i]]
+        if vals.size == 0:
+            raise ValueError(f"region_mask for sample {i} selects no cells")
+        out[i] = _reduce_1d(vals, mode, top_fraction)
+    return out
+
+
 class CNNAutoencoderDetector:
-    def __init__(self, input_shape: tuple[int, int], latent_dim: int = 16):
+    def __init__(self, input_shape: tuple[int, int], latent_dim: int = 16, seed: int = 2026):
         """
         input_shape: (n_symbols, n_subcarriers) of a single OFDM grid window.
         """
         self.input_shape = input_shape
         self.latent_dim = latent_dim
+        tf.keras.utils.set_random_seed(seed)
         self.model = self._build_model()
         self.threshold_: float | None = None  # set by calibrate()
         self.mu_: float | None = None
@@ -42,20 +85,20 @@ class CNNAutoencoderDetector:
         inp = keras.Input(shape=(h, w, 1))
 
         # Encoder
-        x = layers.Conv2D(16, 3, activation="relu", padding="same")(inp)
+        x = layers.Conv2D(16, 3, activation="relu", padding="same", kernel_initializer="he_normal")(inp)
         x = layers.MaxPooling2D(2, padding="same")(x)
-        x = layers.Conv2D(8, 3, activation="relu", padding="same")(x)
+        x = layers.Conv2D(8, 3, activation="relu", padding="same", kernel_initializer="he_normal")(x)
         x = layers.MaxPooling2D(2, padding="same")(x)
         encoded_shape = x.shape[1:]  # remember for decoder upsampling
         x = layers.Flatten()(x)
-        latent = layers.Dense(self.latent_dim, activation="relu", name="latent")(x)
+        latent = layers.Dense(self.latent_dim, activation="relu", name="latent", kernel_initializer="he_normal")(x)
 
         # Decoder
         flat_units = int(np.prod(encoded_shape))
-        x = layers.Dense(flat_units, activation="relu")(latent)
+        x = layers.Dense(flat_units, activation="relu", kernel_initializer="he_normal")(latent)
         x = layers.Reshape(encoded_shape)(x)
-        x = layers.Conv2DTranspose(8, 3, strides=2, activation="relu", padding="same")(x)
-        x = layers.Conv2DTranspose(16, 3, strides=2, activation="relu", padding="same")(x)
+        x = layers.Conv2DTranspose(8, 3, strides=2, activation="relu", padding="same", kernel_initializer="he_normal")(x)
+        x = layers.Conv2DTranspose(16, 3, strides=2, activation="relu", padding="same", kernel_initializer="he_normal")(x)
         # Crop/pad back to exact input size (pooling can round dimensions)
         x = layers.Resizing(h, w)(x)
         out = layers.Conv2D(1, 3, activation="linear", padding="same")(x)
@@ -81,19 +124,34 @@ class CNNAutoencoderDetector:
                                   validation_split=0.1, verbose=verbose)
         return history
 
-    def reconstruction_error(self, grids: np.ndarray) -> np.ndarray:
-        """Per-sample MSE reconstruction error. Higher = more anomalous."""
+    def reconstruction_error(self, grids: np.ndarray, mode: str = "mean", top_fraction: float = 0.01,
+                              region_mask: np.ndarray | None = None) -> np.ndarray:
+        """Per-sample MSE reconstruction error. Higher = more anomalous.
+
+        mode="mean" (default, original behavior) averages over every cell.
+        mode="max" takes the single worst cell. mode="topk" averages the
+        top_fraction worst cells — matches StructuredDAE.reconstruction_error
+        so the two detectors can be compared under the same scoring scheme.
+
+        region_mask, if given, restricts scoring to True cells only — either
+        a single (H, W) boolean mask applied to every sample, or a per-sample
+        (N, H, W) stack (the eMBB target mask varies per scenario in this
+        dataset, so callers scoring the frozen dataset should pass the latter).
+        """
         x = self._prep(grids)
         recon = self.model.predict(x, verbose=0)
-        return np.mean((x - recon) ** 2, axis=(1, 2, 3))
+        sq = np.square(x - recon)[..., 0]
+        if region_mask is None:
+            return _reduce(sq.reshape(len(sq), -1), mode, top_fraction)
+        return _reduce_masked(sq, region_mask, mode, top_fraction)
 
-    def calibrate(self, clean_val_grids: np.ndarray, percentile: float = 95.0):
+    def calibrate(self, clean_val_grids: np.ndarray, percentile: float = 95.0, **score_kwargs):
         """Set detection threshold from the tail of the CLEAN validation
         error distribution. percentile=95 means ~5% false-alarm rate on
         clean data BY CONSTRUCTION — report this alongside any detection
         accuracy number, don't quote accuracy without the FPR it was
         calibrated at."""
-        errors = self.reconstruction_error(clean_val_grids)
+        errors = self.reconstruction_error(clean_val_grids, **score_kwargs)
         self.threshold_ = float(np.percentile(errors, percentile))
         return self.threshold_
 

@@ -13,6 +13,48 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 
+def _reduce(flat: np.ndarray, mode: str, top_fraction: float) -> np.ndarray:
+    if mode == "mean":
+        return flat.mean(axis=1)
+    if mode == "max":
+        return flat.max(axis=1)
+    if mode == "topk":
+        if not 0 < top_fraction <= 1:
+            raise ValueError("top_fraction must be in (0, 1]")
+        k = max(1, int(top_fraction * flat.shape[1]))
+        return np.partition(flat, -k, axis=1)[:, -k:].mean(axis=1)
+    raise ValueError("mode must be one of: mean, max, topk")
+
+
+def _reduce_1d(vals: np.ndarray, mode: str, top_fraction: float) -> float:
+    if mode == "mean":
+        return float(vals.mean())
+    if mode == "max":
+        return float(vals.max())
+    if mode == "topk":
+        if not 0 < top_fraction <= 1:
+            raise ValueError("top_fraction must be in (0, 1]")
+        k = max(1, int(top_fraction * vals.size))
+        return float(np.partition(vals, -k)[-k:].mean())
+    raise ValueError("mode must be one of: mean, max, topk")
+
+
+def _reduce_masked(sq: np.ndarray, region_mask: np.ndarray, mode: str, top_fraction: float) -> np.ndarray:
+    """sq: (N, H, W) squared error. region_mask: (H, W) or (N, H, W) bool."""
+    region_mask = np.asarray(region_mask, dtype=bool)
+    if region_mask.ndim == 2:
+        region_mask = np.broadcast_to(region_mask, sq.shape)
+    if region_mask.shape != sq.shape:
+        raise ValueError(f"region_mask shape {region_mask.shape} does not match error grid shape {sq.shape}")
+    out = np.empty(len(sq), dtype=np.float64)
+    for i in range(len(sq)):
+        vals = sq[i][region_mask[i]]
+        if vals.size == 0:
+            raise ValueError(f"region_mask for sample {i} selects no cells")
+        out[i] = _reduce_1d(vals, mode, top_fraction)
+    return out
+
+
 class StructuredDAE:
     """A CNN DAE with local cell, time, and frequency masking corruption."""
 
@@ -29,17 +71,17 @@ class StructuredDAE:
     def _build_model(self) -> keras.Model:
         h, w = self.input_shape
         inp = keras.Input((h, w, 1))
-        x = layers.Conv2D(32, 3, activation="relu", padding="same")(inp)
+        x = layers.Conv2D(32, 3, activation="relu", padding="same", kernel_initializer="he_normal")(inp)
         x = layers.MaxPooling2D(2, padding="same")(x)
-        x = layers.Conv2D(16, 3, activation="relu", padding="same")(x)
+        x = layers.Conv2D(16, 3, activation="relu", padding="same", kernel_initializer="he_normal")(x)
         x = layers.MaxPooling2D(2, padding="same")(x)
         encoded_shape = x.shape[1:]
         x = layers.Flatten()(x)
-        latent = layers.Dense(self.latent_dim, activation="relu", name="latent")(x)
-        x = layers.Dense(int(np.prod(encoded_shape)), activation="relu")(latent)
+        latent = layers.Dense(self.latent_dim, activation="relu", name="latent", kernel_initializer="he_normal")(x)
+        x = layers.Dense(int(np.prod(encoded_shape)), activation="relu", kernel_initializer="he_normal")(latent)
         x = layers.Reshape(encoded_shape)(x)
-        x = layers.Conv2DTranspose(16, 3, strides=2, activation="relu", padding="same")(x)
-        x = layers.Conv2DTranspose(32, 3, strides=2, activation="relu", padding="same")(x)
+        x = layers.Conv2DTranspose(16, 3, strides=2, activation="relu", padding="same", kernel_initializer="he_normal")(x)
+        x = layers.Conv2DTranspose(32, 3, strides=2, activation="relu", padding="same", kernel_initializer="he_normal")(x)
         x = layers.Resizing(h, w)(x)
         out = layers.Conv2D(1, 3, activation="linear", padding="same")(x)
         model = keras.Model(inp, out, name="structured_dae")
@@ -84,20 +126,18 @@ class StructuredDAE:
         source = self.corrupt(target, mask_probability)
         return self.model.fit(source, target, epochs=epochs, batch_size=batch_size, verbose=verbose)
 
-    def reconstruction_error(self, grids: np.ndarray, mode: str = "topk", top_fraction: float = 0.01) -> np.ndarray:
+    def reconstruction_error(self, grids: np.ndarray, mode: str = "topk", top_fraction: float = 0.01,
+                              region_mask: np.ndarray | None = None) -> np.ndarray:
+        """region_mask, if given, restricts scoring to True cells only —
+        either a single (H, W) mask for every sample, or a per-sample
+        (N, H, W) stack (the eMBB target mask varies per scenario in the
+        frozen dataset, so scoring it needs the latter)."""
         x = self._normalize(grids)
         recon = self.model.predict(x, verbose=0)
-        flat = np.square(x - recon).reshape(len(x), -1)
-        if mode == "mean":
-            return flat.mean(axis=1)
-        if mode == "max":
-            return flat.max(axis=1)
-        if mode == "topk":
-            if not 0 < top_fraction <= 1:
-                raise ValueError("top_fraction must be in (0, 1]")
-            k = max(1, int(top_fraction * flat.shape[1]))
-            return np.partition(flat, -k, axis=1)[:, -k:].mean(axis=1)
-        raise ValueError("mode must be one of: mean, max, topk")
+        sq = np.square(x - recon)[..., 0]
+        if region_mask is None:
+            return _reduce(sq.reshape(len(sq), -1), mode, top_fraction)
+        return _reduce_masked(sq, region_mask, mode, top_fraction)
 
     def calibrate(self, clean_validation: np.ndarray, percentile: float = 95.0, **score_kwargs) -> float:
         self.threshold_ = float(np.percentile(self.reconstruction_error(clean_validation, **score_kwargs), percentile))
