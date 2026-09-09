@@ -81,7 +81,7 @@ class AdaptiveAttacker:
     def generate_covert_bits(self) -> np.ndarray:
         return self.rng.integers(0, 2, size=self.cfg.n_covert_bits)
 
-    def sqrt_law_magnitude(self, n_channel_uses: int, base_magnitude: float = 40.0) -> float:
+    def sqrt_law_magnitude(self, n_channel_uses: int, base_magnitude: float = 4.0) -> float:
         """Per-symbol perturbation magnitude scaled so cumulative detectability
         stays bounded as channel uses grow — magnitude ~ 1/sqrt(n) per use,
         giving O(sqrt(n)) total covert information, per the sqrt-law."""
