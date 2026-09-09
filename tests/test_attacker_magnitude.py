@@ -48,6 +48,34 @@ def test_adaptive_ceiling_keeps_perturbation_below_non_adaptive(seed):
     )
 
 
+def test_adaptive_ceiling_binds_when_shaped_magnitude_would_exceed_it(monkeypatch):
+    # Force sqrt_law_magnitude to return an artificially huge value, and use
+    # a synthetic high-variance grid so local_std is also large — together
+    # magnitude * local_std is far beyond fixed_magnitude * 0.6, so the only
+    # thing keeping the per-cell delta bounded is the np.clip in inject().
+    monkeypatch.setattr(AdaptiveAttacker, "sqrt_law_magnitude", lambda self, n: 50.0)
+
+    # local_std is computed from positive grid values, so the grid needs real
+    # variance among them (a constant grid has std=0, which would zero out
+    # the shaped magnitude regardless of clipping and hide the bug).
+    grid = np.array([[10.0, 90.0, 20.0, 80.0]] * 4)
+    target_mask = np.ones((4, 4), dtype=bool)
+
+    fixed_magnitude = 0.5
+    ceiling = fixed_magnitude * 0.6
+
+    adaptive = AdaptiveAttacker(AttackerConfig(n_covert_bits=16, seed=1))
+    perturbed = adaptive.inject(grid, target_mask, fixed_magnitude=fixed_magnitude)
+
+    delta = perturbed - grid
+    touched = delta != 0
+    assert touched.any(), "expected the attacker to perturb at least one cell"
+    assert np.allclose(np.abs(delta[touched]), ceiling), (
+        f"expected every perturbed cell to be clipped to exactly {ceiling}, "
+        f"got magnitudes {np.unique(np.abs(delta[touched]))}"
+    )
+
+
 def test_adaptive_magnitude_shrinks_with_more_channel_uses():
     attacker = AdaptiveAttacker(AttackerConfig(seed=1))
     small = attacker.sqrt_law_magnitude(4)
