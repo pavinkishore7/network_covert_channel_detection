@@ -87,7 +87,8 @@ class AdaptiveAttacker:
         giving O(sqrt(n)) total covert information, per the sqrt-law."""
         return base_magnitude / np.sqrt(max(n_channel_uses, 1))
 
-    def inject(self, interference_grid: np.ndarray, target_mask: np.ndarray) -> np.ndarray:
+    def inject(self, interference_grid: np.ndarray, target_mask: np.ndarray,
+               fixed_magnitude: float = 0.5) -> np.ndarray:
         """Shape perturbation to local interference standard deviation so the
         covert signal doesn't stick out as a flat, unnaturally uniform
         perturbation (which is what makes the non-adaptive attacker easy to
@@ -111,10 +112,16 @@ class AdaptiveAttacker:
         # wildly different from, the natural variance around each subcarrier
         local_std = np.std(interference_grid[interference_grid > 0]) if np.any(interference_grid > 0) else 1.0
 
+        # Hard ceiling: regardless of n_channel_uses/local_std, the adaptive
+        # perturbation must never exceed 60% of the non-adaptive baseline —
+        # base_magnitude alone doesn't guarantee this, so enforce it directly.
+        ceiling = fixed_magnitude * 0.6
+
         n_slots = min(len(bits), len(target_idx))
         for i in range(n_slots):
             t, f = target_idx[i]
             shaped = magnitude * local_std * self.rng.normal(1.0, 0.15)
+            shaped = np.clip(shaped, -ceiling, ceiling)
             grid[t, f] += shaped if bits[i] else -shaped
 
         return grid
