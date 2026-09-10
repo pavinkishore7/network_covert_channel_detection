@@ -26,7 +26,9 @@ asks "isn't this already done."
 ```
 slicing_sim/      Network slicing + OFDM resource allocation simulation
 covert_channel/   NonAdaptiveAttacker (baseline) + AdaptiveAttacker (sqrt-law-bounded, shaped)
-detector/         CNN Autoencoder anomaly detector (TensorFlow/Keras) — see docs/DECISIONS.md
+detector/         AutoencoderDetector: canonical CNN autoencoder (TensorFlow/Keras) —
+                  see docs/DECISIONS.md. detector/legacy/ holds NumPy-only
+                  dependency-light fallback/benchmark detectors (not canonical).
 pqc_auth/         Optional CRYSTALS-Dilithium adapter + dual-trigger re-auth policy
 dashboard/        Streamlit app — visualizes sim/attacker output live
 monitoring/       Prometheus exporter + Grafana provisioning (untested end-to-end, see below)

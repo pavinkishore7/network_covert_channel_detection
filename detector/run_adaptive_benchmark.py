@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from covert_channel.attacker import AdaptiveAttacker, AttackerConfig, NonAdaptiveAttacker
-from detector.adaptive_residual import AdaptiveResidualDetector
+from detector.legacy.adaptive_residual import AdaptiveResidualDetector
 from slicing_sim.ofdm_grid import NetworkSlicingSimulator, OFDMGridConfig
 from slicing_sim.channel import ChannelImpairmentConfig
 

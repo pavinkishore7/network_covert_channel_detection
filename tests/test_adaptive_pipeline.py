@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from detector.adaptive_residual import AdaptiveResidualDetector
+from detector.legacy.adaptive_residual import AdaptiveResidualDetector
 from pqc_auth.reauth import DualTriggerReauthController, ReauthReason
 
 
