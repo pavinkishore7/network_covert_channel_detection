@@ -32,13 +32,19 @@ dashboard/        Streamlit app — visualizes sim/attacker output live
 monitoring/       Prometheus exporter + Grafana provisioning (untested end-to-end, see below)
 results/          Output plots, CSVs, benchmark numbers — versioned, not overwritten
 docs/             Design decisions, setup guides, meeting notes
-tests/            pytest unit tests (not yet written)
+tests/            pytest unit tests — 4 files, 14 passing tests
 ```
 
 ## What's actually implemented vs. still a stub
 - **Working, smoke-tested:** `slicing_sim/ofdm_grid.py`, `covert_channel/attacker.py`
-  (both non-adaptive and adaptive), `detector/cnn_autoencoder.py` (architecture
-  runs end-to-end; not trained on real data volume yet), `dashboard/app.py`.
+  (both non-adaptive and adaptive), `dashboard/app.py`.
+- **Trained and evaluated:** `CNNAutoencoderDetector` (`detector/cnn_autoencoder.py`)
+  and `StructuredDAE` (`detector/dae_autoencoder.py`) have both been trained on the
+  frozen dataset (`detector/generate_frozen_dataset.py`, 4200 rows spanning 7 SNR
+  levels x 3 scenario classes) and evaluated across all 7 SNR levels x 2 attacker
+  types (non-adaptive, adaptive) with region-masked reconstruction-error scoring
+  and per-SNR calibrated thresholds. Results: `results/cnn_autoencoder_results.csv`,
+  `results/structured_dae_results.csv`.
 - **Written but NOT run end-to-end:** `docker-compose.yml`, `monitoring/exporter.py`
   inside Docker, Grafana provisioning. No Docker available in the environment
   this was built in — test locally before relying on it for a demo.
@@ -90,4 +96,8 @@ work with a bare `pip install` — there's a C library build step first.
 - Adaptive-detector metrics are simulation-only and must be reported with their
   configured false-positive rate; they do not establish field robustness.
 - Square-root law covert-channel bound is derived under **AWGN**; real multipath 5G channels aren't validated yet.
-- Phase 1 = design + simulation only. No empirical detection-accuracy numbers exist yet — don't present projected numbers as measured.
+- Phase 1 = design + simulation only. Empirical numbers (see
+  `results/cnn_autoencoder_results.csv` / `results/structured_dae_results.csv`) are
+  simulation-only, not field-validated: ROC-AUC against the non-adaptive attacker
+  climbs from ~0.53 at 0dB to ~0.99 at 30dB, while against the adaptive attacker it
+  stays much lower, ~0.52 at 0dB to ~0.74 at 30dB — the headline finding of Phase 1.
