@@ -32,9 +32,34 @@ class FakeSigner:
     def __init__(self, key: bytes | None = None):
         self._key = self._DEFAULT_TEST_KEY if key is None else key
 
+    @property
+    def public_key(self) -> bytes:
+        """NOT a real public key -- HMAC is symmetric, so this is the same
+        secret key used to sign. Named ``public_key`` only so this class
+        mirrors OqsDilithiumSigner's ``.public_key`` attribute shape for
+        code (like pqc_auth.transport) that treats signer backends
+        uniformly. Handing this out is exactly as unsafe as it sounds for
+        real crypto -- acceptable here only because FakeSigner never signs
+        or verifies anything outside a test process."""
+        return self._key
+
     def sign(self, message: bytes) -> bytes:
         return hmac.new(self._key, message, hashlib.sha256).digest()
 
     def verify(self, message: bytes, signature: bytes) -> bool:
         expected = self.sign(message)
+        return hmac.compare_digest(expected, signature)
+
+    @staticmethod
+    def verify_with_public_key(message: bytes, signature: bytes, public_key: bytes) -> bool:
+        """Test-fixture simplification, not a claim that HMAC is
+        asymmetric: mirrors pqc_auth.dilithium.verify_with_public_key's
+        call shape, (message, signature, public_key) -> bool, so a
+        verifying party can be written once and tested against either
+        backend. Here ``public_key`` is really the shared HMAC key -- there
+        is no public/private key separation for a symmetric MAC. This
+        staticmethod takes no signer instance, matching the
+        verify-with-only-a-public-key contract real callers rely on.
+        """
+        expected = hmac.new(public_key, message, hashlib.sha256).digest()
         return hmac.compare_digest(expected, signature)

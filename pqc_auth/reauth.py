@@ -36,6 +36,29 @@ class Signer(Protocol):
     def verify(self, message: bytes, signature: bytes) -> bool: ...
 
 
+@runtime_checkable
+class PublicKeyVerifier(Protocol):
+    """Structural interface for a verifying party that holds ONLY a public
+    key — never a signing capability. A real ``Signer`` (above) can sign
+    AND self-verify; this is deliberately narrower: it takes the public key
+    as an explicit argument on every call, so it can be satisfied by a bare
+    module-level function with no signer instance behind it at all.
+
+    Concrete examples matching this call shape, both ``(message, signature,
+    public_key) -> bool``: ``pqc_auth.dilithium.verify_with_public_key``
+    (a free function — nothing to instantiate) and
+    ``tests.fake_signer.FakeSigner.verify_with_public_key`` (a staticmethod,
+    callable without ever constructing a signer).
+
+    ``pqc_auth.transport``'s client role is typed against this Protocol,
+    not ``Signer``: a client that only ever receives a bound function
+    matching this shape has no way to accidentally end up with signing
+    capability, by construction rather than by convention.
+    """
+
+    def __call__(self, message: bytes, signature: bytes, public_key: bytes) -> bool: ...
+
+
 class ReauthReason(str, Enum):
     PERIODIC = "periodic"
     DETECTOR_ALERT = "detector_alert"

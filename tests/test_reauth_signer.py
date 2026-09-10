@@ -77,5 +77,34 @@ class ReauthWithSignerTests(unittest.TestCase):
         self.assertFalse(other_signer.verify(outcome.nonce, outcome.signature))
 
 
+class FakeSignerPublicKeyVerifyTests(unittest.TestCase):
+    """FakeSigner.verify_with_public_key mirrors
+    pqc_auth.dilithium.verify_with_public_key's call shape so a verifying
+    party can be tested against either backend without special-casing."""
+
+    def test_verifies_without_any_signer_instance(self):
+        signer = FakeSigner()
+        message = b"slice re-auth challenge: URLLC t=0"
+        signature = signer.sign(message)
+        # No signer instance passed below -- only the "public key" bytes.
+        self.assertTrue(FakeSigner.verify_with_public_key(message, signature, signer.public_key))
+
+    def test_matches_instance_verify(self):
+        signer = FakeSigner()
+        message = b"slice re-auth challenge: URLLC t=0"
+        signature = signer.sign(message)
+        self.assertEqual(
+            signer.verify(message, signature),
+            FakeSigner.verify_with_public_key(message, signature, signer.public_key),
+        )
+
+    def test_wrong_public_key_fails_verification(self):
+        signer = FakeSigner()
+        message = b"slice re-auth challenge: URLLC t=0"
+        signature = signer.sign(message)
+        wrong_key = b"a-completely-different-test-key"
+        self.assertFalse(FakeSigner.verify_with_public_key(message, signature, wrong_key))
+
+
 if __name__ == "__main__":
     unittest.main()
