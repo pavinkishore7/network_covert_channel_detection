@@ -38,12 +38,13 @@ tests/            pytest unit tests — 4 files, 14 passing tests
 ## What's actually implemented vs. still a stub
 - **Working, smoke-tested:** `slicing_sim/ofdm_grid.py`, `covert_channel/attacker.py`
   (both non-adaptive and adaptive), `dashboard/app.py`.
-- **Trained and evaluated:** `CNNAutoencoderDetector` (`detector/cnn_autoencoder.py`)
-  and `StructuredDAE` (`detector/dae_autoencoder.py`) have both been trained on the
-  frozen dataset (`detector/generate_frozen_dataset.py`, 4200 rows spanning 7 SNR
-  levels x 3 scenario classes) and evaluated across all 7 SNR levels x 2 attacker
-  types (non-adaptive, adaptive) with region-masked reconstruction-error scoring
-  and per-SNR calibrated thresholds. Results: `results/cnn_autoencoder_results.csv`,
+- **Trained and evaluated:** `detector/autoencoder_detector.py`'s `AutoencoderDetector`
+  class is the canonical detector — its `cnn_preset` and `structured_dae_preset`
+  (replacing what were previously two separate near-duplicate files) have both been
+  trained on the frozen dataset (`detector/generate_frozen_dataset.py`, 4200 rows
+  spanning 7 SNR levels x 3 scenario classes) and evaluated across all 7 SNR levels
+  x 2 attacker types (non-adaptive, adaptive) with region-masked reconstruction-error
+  scoring and per-SNR calibrated thresholds. Results: `results/cnn_autoencoder_results.csv`,
   `results/structured_dae_results.csv`.
 - **Written but NOT run end-to-end:** `docker-compose.yml`, `monitoring/exporter.py`
   inside Docker, Grafana provisioning. No Docker available in the environment

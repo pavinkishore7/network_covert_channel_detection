@@ -5,7 +5,7 @@ Produces a per-slice OFDM resource allocation over time: which subcarriers
 are active, their power/interference levels, per symbol, per slice.
 This resource grid is the shared object that:
   - covert_channel.attacker perturbs (to hide a covert signal in it)
-  - detector.cnn_autoencoder learns the "normal" distribution of
+  - detector.autoencoder_detector learns the "normal" distribution of
 
 Slice types modeled: URLLC, eMBB, mMTC — each with different subcarrier
 allocation patterns and timing tolerances (used later for the slice-aware

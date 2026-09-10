@@ -79,7 +79,7 @@ def detection_rate_at_fpr(clean_scores: np.ndarray, attack_scores: np.ndarray, t
 def main() -> None:
     # Keep the split utility importable for protocol tests even on systems
     # that have not installed the TensorFlow experiment dependency yet.
-    from detector.dae_autoencoder import StructuredDAE
+    from detector.autoencoder_detector import AutoencoderDetector
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
@@ -97,7 +97,7 @@ def main() -> None:
     if X.shape != (4200, 200, 64) or set(np.unique(y)) != {0, 1, 2}:
         raise ValueError("Unexpected frozen dataset shape or labels")
     train, valid, test = matched_split(y, snr)
-    model = StructuredDAE(X.shape[1:], seed=args.seed)
+    model = AutoencoderDetector.structured_dae_preset(X.shape[1:], seed=args.seed)
     model.fit(X[train][y[train] == 0], epochs=args.epochs, batch_size=args.batch_size,
               mask_probability=args.mask_probability, verbose=2)
 

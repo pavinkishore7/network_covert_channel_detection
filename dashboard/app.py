@@ -85,7 +85,7 @@ if st.button("Run simulation", type="primary"):
 
     st.info(
         "Detector reconstruction-error view requires a trained model (see "
-        "detector/cnn_autoencoder.py). Train and save a model, then load it "
+        "detector/autoencoder_detector.py). Train and save a model, then load it "
         "here — not wired up yet since training needs real data volume, "
         "not this dashboard's single-run scope."
     )

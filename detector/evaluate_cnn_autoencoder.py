@@ -1,10 +1,11 @@
-"""Run the settled CNNAutoencoderDetector architecture on the frozen dataset.
+"""Run the settled cnn_preset AutoencoderDetector architecture on the frozen dataset.
 
 Mirrors evaluate_structured_dae.py's protocol exactly (same matched_split,
 same train+valid combined per-SNR calibration, same output columns) so the
-two detectors are directly comparable. StructuredDAE and CNNAutoencoderDetector
-are different architectures — this script evaluates the one documented as
-"settled" in cnn_autoencoder.py; evaluate_structured_dae.py evaluates the
+two detectors are directly comparable. The structured_dae_preset and
+cnn_preset (both detector.autoencoder_detector.AutoencoderDetector) are
+different architectures — this script evaluates the one documented as
+"settled" in autoencoder_detector.py; evaluate_structured_dae.py evaluates the
 other. Neither result stands in for the other.
 """
 
@@ -36,7 +37,7 @@ def detection_rate_at_fpr(clean_scores: np.ndarray, attack_scores: np.ndarray, t
 
 
 def main() -> None:
-    from detector.cnn_autoencoder import CNNAutoencoderDetector
+    from detector.autoencoder_detector import AutoencoderDetector
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
@@ -53,7 +54,7 @@ def main() -> None:
     if X.shape != (4200, 200, 64) or set(np.unique(y)) != {0, 1, 2}:
         raise ValueError("Unexpected frozen dataset shape or labels")
     train, valid, test = matched_split(y, snr)
-    model = CNNAutoencoderDetector(X.shape[1:], seed=args.seed)
+    model = AutoencoderDetector.cnn_preset(X.shape[1:], seed=args.seed)
     model.fit(X[train][y[train] == 0], epochs=args.epochs, batch_size=args.batch_size, verbose=2)
 
     # Same protocol as evaluate_structured_dae.py: calibrate each SNR band's
