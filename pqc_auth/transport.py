@@ -49,6 +49,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
+from pqc_auth.audit_log import AuditLogger
 from pqc_auth.reauth import DualTriggerReauthController, ReauthReason
 
 # How long the client remembers a nonce it has accepted, in the same units
@@ -144,6 +145,9 @@ class ReauthServer:
                 # Label only -- the client's trust decision never depends
                 # on this string, it's informational (logging/demo output).
                 "backend": self.backend_name,
+                # Echoed back only for the client's own audit log record --
+                # not used in any trust decision.
+                "slice_type": request["slice_type"],
             }
         _send_line(conn, json.dumps(response).encode())
 
@@ -175,6 +179,7 @@ class ReauthClient:
         verify_fn: Callable[[bytes, bytes, bytes], bool],
         replay_window_seconds: float = DEFAULT_REPLAY_WINDOW_SECONDS,
         timeout: float = 5.0,
+        audit_log_path: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -182,6 +187,10 @@ class ReauthClient:
         self._replay_window_seconds = replay_window_seconds
         self._timeout = timeout
         self._seen_nonces: dict[bytes, float] = {}
+        # None by default so existing tests/callers get no file side
+        # effects; set audit_log_path to append a record for every real
+        # client-side verification (see pqc_auth/audit_log.py).
+        self._audit_logger = AuditLogger(audit_log_path) if audit_log_path is not None else None
 
     def request_reauth(self, slice_type: str, now: float, detector_alert: bool = False) -> ClientVerificationResult:
         """Send a real request over a real socket, then independently verify the response."""
@@ -216,12 +225,39 @@ class ReauthClient:
 
         self._prune_expired(now)
         if nonce in self._seen_nonces:
+            self._log_verification(response, reason, nonce, signature, public_key, backend, trusted=False, rejected_as_replay=True)
             return ClientVerificationResult(due=True, reason=reason, trusted=False, rejected_as_replay=True, backend=backend)
 
         trusted = self._verify_fn(nonce, signature, public_key)
         if trusted:
             self._seen_nonces[nonce] = now
+        self._log_verification(response, reason, nonce, signature, public_key, backend, trusted=trusted, rejected_as_replay=False)
         return ClientVerificationResult(due=True, reason=reason, trusted=trusted, rejected_as_replay=False, backend=backend)
+
+    def _log_verification(
+        self,
+        response: dict,
+        reason: ReauthReason,
+        nonce: bytes,
+        signature: bytes,
+        public_key: bytes,
+        backend: str | None,
+        *,
+        trusted: bool,
+        rejected_as_replay: bool,
+    ) -> None:
+        if self._audit_logger is None:
+            return
+        self._audit_logger.log(
+            slice_type=response.get("slice_type", ""),
+            reason=reason.value,
+            nonce=nonce,
+            signature=signature,
+            public_key=public_key,
+            backend=backend or "",
+            trusted=trusted,
+            rejected_as_replay=rejected_as_replay,
+        )
 
     def _prune_expired(self, now: float) -> None:
         cutoff = now - self._replay_window_seconds
