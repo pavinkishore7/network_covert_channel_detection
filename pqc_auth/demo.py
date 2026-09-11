@@ -27,6 +27,17 @@ boundary. It is clearly labeled, used only here, and the backend in use is
 always printed, so there's no ambiguity about which signer is actually
 running.
 
+Leaves state behind under ``pqc_auth/.demo_state/`` (gitignored,
+PLAINTEXT, demo-only -- see pqc_auth/README.md): an ``oqs_key/`` directory
+so the real signer has a stable identity across runs instead of a fresh
+keypair every time, and an append-only ``audit_log.jsonl`` that every run
+adds to (both backends log to the same file, distinguished by each
+record's ``backend`` field, so it's clear which entries are HMAC-backed --
+NOT post-quantum -- versus real ML-DSA-65 ones if this demo is ever run
+both with and without oqs on the same machine). After the trace, this demo
+runs pqc_auth.audit_verify's own independent check against that log and
+prints its PASS/FAIL summary as the last thing it prints.
+
 What this demo does NOT claim: it is not a production deployment, not a
 benchmark, and not proof the crypto is used correctly under real adversarial
 network conditions beyond the two rejection cases shown here. See
@@ -37,9 +48,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from pathlib import Path
 
+from pqc_auth.audit_verify import format_report, verify_log
 from pqc_auth.reauth import DualTriggerReauthController
 from pqc_auth.transport import ReauthClient, ReauthServer
+
+DEMO_STATE_DIR = Path(__file__).parent / ".demo_state"
+DEMO_KEY_DIR = DEMO_STATE_DIR / "oqs_key"
+DEMO_AUDIT_LOG_PATH = DEMO_STATE_DIR / "audit_log.jsonl"
 
 
 class _DemoFakeSigner:
@@ -68,10 +85,12 @@ def _make_signer():
     try:
         import oqs  # noqa: F401
     except ImportError:
-        return _DemoFakeSigner(), _DemoFakeSigner.verify_with_public_key, "_DemoFakeSigner (oqs not installed -- HMAC stand-in)"
+        label = "_DemoFakeSigner (oqs not installed -- HMAC stand-in, NOT post-quantum)"
+        return _DemoFakeSigner(), _DemoFakeSigner.verify_with_public_key, label
     from pqc_auth.dilithium import OqsDilithiumSigner, verify_with_public_key
 
-    return OqsDilithiumSigner(), verify_with_public_key, "OqsDilithiumSigner (ML-DSA-65, real liboqs)"
+    signer = OqsDilithiumSigner(key_path=str(DEMO_KEY_DIR))
+    return signer, verify_with_public_key, "OqsDilithiumSigner (ML-DSA-65, real liboqs, persisted key_path)"
 
 
 def _print_result(label: str, result) -> None:
@@ -91,7 +110,9 @@ def main() -> None:
     controller = DualTriggerReauthController(signer=signer)
     server = ReauthServer(controller)
     server.start()
-    client = ReauthClient(server.host, server.port, verify_fn=verify_fn)
+    client = ReauthClient(
+        server.host, server.port, verify_fn=verify_fn, audit_log_path=str(DEMO_AUDIT_LOG_PATH)
+    )
     print(f"Server listening on {server.host}:{server.port}\n")
 
     try:
@@ -122,6 +143,9 @@ def main() -> None:
         server.stop()
 
     print("\nDone.")
+
+    print(f"\nIndependently auditing {DEMO_AUDIT_LOG_PATH} ...\n")
+    print(format_report(verify_log(DEMO_AUDIT_LOG_PATH)))
 
 
 if __name__ == "__main__":
