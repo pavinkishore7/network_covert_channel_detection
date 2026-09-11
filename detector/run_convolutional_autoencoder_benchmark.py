@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from detector.convolutional_autoencoder import ConvolutionalPatchAutoencoder
+from detector.legacy.convolutional_autoencoder import ConvolutionalPatchAutoencoder
 from detector.run_adaptive_benchmark import _auc, _collect, _pr_auc
 
 

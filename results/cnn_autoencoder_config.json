@@ -1,0 +1,6 @@
+{
+  "results_dir": "results",
+  "epochs": 30,
+  "batch_size": 16,
+  "seed": 2026
+}

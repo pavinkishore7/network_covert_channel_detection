@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from detector.convolutional_autoencoder import ConvolutionalPatchAutoencoder
+from detector.legacy.convolutional_autoencoder import ConvolutionalPatchAutoencoder
 from slicing_sim.mixed_numerology import MixedNumerologyRAN, Numerology
 
 

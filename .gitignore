@@ -20,3 +20,9 @@ Thumbs.db
 *.log
 *.h5
 *.ckpt
+results/dataset_X.npy
+results/dataset_y.npy
+results/dataset_snr.npy
+
+# pqc_auth demo-only state: plaintext keys + accumulated audit log, never committed
+pqc_auth/.demo_state/
