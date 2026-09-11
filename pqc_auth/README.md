@@ -112,11 +112,21 @@ which signer backend it actually used; no setup is required either way.
 Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
 `docs/NOVELTY.md`) of not overclaiming:
 
-- **No key persistence across restarts.** Every `OqsDilithiumSigner` or
-  `FakeSigner`/`_DemoFakeSigner` generates or holds its key material only
-  in memory for the life of the process. Restart the server and it has a
-  new keypair; nothing here handles key distribution to already-connected
-  clients or re-establishing trust after a restart.
+- **Key persistence exists now, but only as plaintext files, and only for
+  `OqsDilithiumSigner`.** Passing `key_path` to `OqsDilithiumSigner.__init__`
+  saves the exported secret key and public key to `secret_key.bin` /
+  `public_key.bin` under that directory and reloads them on the next
+  construction, so the same identity survives a process restart. This is
+  PLAINTEXT ON DISK: no encryption at rest, no access control beyond OS
+  file permissions, and no rotation -- acceptable only for this project's
+  demo/review purposes, not a production key-management approach. Without
+  `key_path` (the default), behavior is unchanged: a fresh in-memory-only
+  keypair every construction. `FakeSigner`/`_DemoFakeSigner` were not
+  touched -- `FakeSigner` already uses a fixed default HMAC key
+  (`_DEFAULT_TEST_KEY`), so it was already trivially "persistent" across
+  runs with no code change needed. Nothing here handles key distribution
+  to already-connected clients or re-establishing trust after a restart
+  beyond loading the same keypair back.
 - **No key rotation policy.** A signer's key is fixed for its lifetime;
   there is no rotation schedule, no revocation, and no way to signal "this
   public key is no longer valid" to a client.
