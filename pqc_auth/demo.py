@@ -71,7 +71,7 @@ def _make_signer():
         return _DemoFakeSigner(), _DemoFakeSigner.verify_with_public_key, "_DemoFakeSigner (oqs not installed -- HMAC stand-in)"
     from pqc_auth.dilithium import OqsDilithiumSigner, verify_with_public_key
 
-    return OqsDilithiumSigner(), verify_with_public_key, "OqsDilithiumSigner (Dilithium3, real liboqs)"
+    return OqsDilithiumSigner(), verify_with_public_key, "OqsDilithiumSigner (ML-DSA-65, real liboqs)"
 
 
 def _print_result(label: str, result) -> None:

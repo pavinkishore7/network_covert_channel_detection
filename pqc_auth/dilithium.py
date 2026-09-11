@@ -7,7 +7,8 @@ backend is unavailable, which prevents accidental PQC overclaims.
 from __future__ import annotations
 
 
-def verify_with_public_key(message: bytes, signature: bytes, public_key: bytes, algorithm: str = "Dilithium3") -> bool:
+# liboqs renamed Dilithium to ML-DSA per FIPS 204; ML-DSA-65 is Dilithium3's equivalent security category.
+def verify_with_public_key(message: bytes, signature: bytes, public_key: bytes, algorithm: str = "ML-DSA-65") -> bool:
     """Verify a signature against an EXPLICIT public key, independent of any
     signer instance's own keypair.
 
@@ -25,7 +26,8 @@ def verify_with_public_key(message: bytes, signature: bytes, public_key: bytes, 
 
 
 class OqsDilithiumSigner:
-    def __init__(self, algorithm: str = "Dilithium3"):
+    # liboqs renamed Dilithium to ML-DSA per FIPS 204; ML-DSA-65 is Dilithium3's equivalent security category.
+    def __init__(self, algorithm: str = "ML-DSA-65"):
         try:
             import oqs  # type: ignore[import-not-found]
         except ImportError as exc:

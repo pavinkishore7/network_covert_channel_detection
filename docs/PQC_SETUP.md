@@ -35,7 +35,10 @@ confirmed Visual Studio Build Tools + CMake + Ninja are all installed and on PAT
 ```bash
 python -c "import oqs; print(oqs.get_enabled_sig_mechanisms())"
 ```
-You should see `Dilithium2`, `Dilithium3`, `Dilithium5` in the printed list.
+You should see `ML-DSA-44`, `ML-DSA-65`, `ML-DSA-87` in the printed list.
+(Newer liboqs builds renamed Dilithium2/3/5 to ML-DSA-44/65/87 per NIST
+FIPS 204 — same algorithms, new standardized names — so don't be thrown off
+if you don't see "Dilithium" anywhere.)
 If this errors with `ImportError` or `OSError: liboqs.so not found`, the
 build step above didn't complete — don't debug the Python side yet, fix the
 build first.
