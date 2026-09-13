@@ -50,7 +50,8 @@ wire at all. `ReauthClient` holds only a public key and a bare
 `transport.py` never imports a concrete signer backend itself, which is
 what keeps it signer-agnostic. The client independently verifies every
 response; it never trusts anything the server claims about its own
-verification.
+verification. It can optionally be pinned to one specific
+`expected_public_key` — see "Public-key pinning" below.
 
 Replay protection lives entirely on the client: `ReauthClient` remembers
 accepted nonces for `DEFAULT_REPLAY_WINDOW_SECONDS` (300s, chosen to exceed
@@ -59,7 +60,46 @@ nonce is never pruned mid-cycle, while still bounding memory for a
 long-running client) and rejects a repeated nonce even when its signature
 is still cryptographically valid.
 
+**Public-key pinning.** `ReauthClient(..., expected_public_key=...)` pins
+the client to one specific identity. In `process_response()`, if the
+response's `public_key` doesn't match `expected_public_key` byte-for-byte,
+the response is rejected as `pinned_key_mismatch=True` — and this check
+happens **before** `verify_fn` is even called. That ordering is
+deliberate: a signature can be perfectly, genuinely valid and still be
+signed by the wrong keypair (a second signer with its own real identity,
+impersonating the expected one), so checking cryptographic validity first
+would answer a question nobody asked — the point of pinning is that the
+key itself is wrong, independent of whether a signature under that wrong
+key would itself verify. A pinning rejection does not mark the nonce as
+seen (it was never accepted) and does not call `verify_fn` at all.
+
+What pinning solves: without it, `ReauthClient` trusts *any* public key
+that arrives over the wire with a self-consistent signature — verify_fn
+only ever checks "is this signature genuine under the key attached to
+it", never "is this the key I actually meant to trust". Pinning closes
+that gap, but **only if `expected_public_key` was itself obtained through
+some trusted channel to begin with**. This project still ships **no
+key-distribution or certificate infrastructure of any kind**: nothing
+here proves that the bytes handed to `expected_public_key=` are the real
+server's key rather than an attacker's, verifies a certificate chain, or
+handles first-contact trust establishment ("trust on first use" and
+everything that implies is entirely out of scope). In the demo
+(`pqc_auth/demo.py`), the client is pinned to `signer.public_key` — i.e.
+the same process's own key, obtained in-process, which only proves the
+pinning *mechanism* works; it is not a demonstration of secure key
+distribution, because there is no separate, independent channel involved.
+Rotating a pinned key, or re-establishing trust after a server's identity
+legitimately changes, is not handled here either — see "What's still not
+done" below.
+
 **`demo.py`** — `python -m pqc_auth.demo` (see below).
+
+**`live_loop.py`** — `python -m pqc_auth.live_loop` (see "Running the live
+detector-to-reauth loop" below): a continuous demonstration that a real
+`detector.autoencoder_detector.AutoencoderDetector`'s own anomaly
+predictions can drive real, independently-verified re-auth over the actual
+transport, not just `pqc_auth.orchestration.drive_reauth_from_detector_flags()`
+in isolation.
 
 ## What's tested vs. what requires liboqs
 
@@ -102,10 +142,67 @@ python -m pqc_auth.demo
 
 Starts a `ReauthServer` and `ReauthClient` on `127.0.0.1` (an OS-assigned
 port) and prints a trace of: periodic re-auth, a detector alert firing
-re-auth early with the immediate repeat suppressed by cooldown, and a
+re-auth early with the immediate repeat suppressed by cooldown, a
 tampered signature followed by a replay of a genuine message — both
-rejected independently by the client. It auto-detects `oqs` and prints
-which signer backend it actually used; no setup is required either way.
+rejected independently by the client — and a public-key pinning rejection,
+where a second, different signer's genuinely valid signature (valid under
+its own key) is rejected purely because it isn't the pinned key. It
+auto-detects `oqs` and prints which signer backend it actually used; no
+setup is required either way.
+
+## Running the live detector-to-reauth loop
+
+```bash
+python -m pqc_auth.live_loop [--ticks N] [--interval-seconds S]
+```
+
+Trains and calibrates one `AutoencoderDetector.cnn_preset` using this
+project's existing fast train+calibrate protocol
+(`detector/generate_frozen_dataset.py` + `detector/evaluate_structured_dae.py`'s
+`matched_split()`/`target_masks_for_rows()` + the per-SNR-band calibration
+`detector/evaluate_cnn_autoencoder.py` uses — reused directly, at ONE SNR
+band's 200 scenarios instead of all seven and a handful of epochs, not
+reimplemented), then streams that detector's own held-out test split one
+window per tick. Each tick's window is scored with the detector's OWN
+reconstruction-error/threshold call — never the ground-truth label — and
+that verdict alone drives `pqc_auth.orchestration.drive_reauth_from_detector_flags()`
+against a real, signer-equipped `DualTriggerReauthController`; every tick
+that decides re-auth is due gets a real, independent verification round
+trip over an actual local TCP socket via `ReauthServer`/`ReauthClient`
+(pinned to the signer's own public key), logged to the same
+`pqc_auth.audit_log` mechanism as everything else here. At the end it runs
+`pqc_auth.audit_verify` against that log and prints its PASS/FAIL summary.
+
+Stated plainly, matching this project's own habit of not overclaiming:
+
+- **This streams EXISTING SIMULATED / held-out windows, not live captured
+  network traffic.** The windows come from
+  `detector/generate_frozen_dataset.py`'s protocol (OFDM interference
+  grids with simulated attacker injections), replayed one at a time. Real
+  integration with captured traffic depends on the separate,
+  currently-unstarted network-layer work in this project.
+- **The detector is trained FAST, for this demo only** — a few epochs on
+  one SNR band's 200 scenarios (a few tens of seconds total, including the
+  one-time TensorFlow import), not the full 3x Colab-scale run described
+  in `notebooks/README.md`. Its detection-rate/false-alarm numbers, if you
+  look at them in a run's trace, are demo-scale artifacts and must not be
+  quoted as representative of the real detector's performance.
+- **Ground-truth attack labels never influence the reauth decision.** They
+  are printed in the trace and carried on every trace entry purely for
+  demo transparency and this module's own tests
+  (`tests/test_live_loop.py` checks this structurally) — the trigger fed
+  to `drive_reauth_from_detector_flags()` is only ever the detector's own
+  prediction.
+- **liboqs and TensorFlow must be imported in a specific order in the same
+  process, or the process crashes.** Confirmed by isolating it: importing
+  `tensorflow` before `oqs` and then using `oqs` to sign anything crashes
+  with `free(): invalid pointer` (a native allocator conflict, not a bug
+  in either library's own logic); importing `oqs` first avoids it
+  entirely. `run_live_loop()` constructs the signer before training the
+  detector for exactly this reason — this is the first place in this
+  project that needed both liboqs and TensorFlow in one process at all
+  (`pqc_auth/demo.py` never imports TensorFlow; `detector/*.py` never
+  imports `oqs`), so nothing before this surfaced the conflict.
 
 ## What's still not done
 
@@ -151,3 +248,8 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   correctly reports `trusted=False` or `rejected_as_replay=True`, but there
   is no retry policy, alerting, or lockout behavior built on top of that
   result yet — that decision is left to the caller.
+- **No key-distribution or certificate infrastructure behind pinning.**
+  `expected_public_key` only compares bytes the caller already has; it does
+  not obtain them, verify a certificate chain, handle first-contact trust,
+  or support rotating the pinned key without restarting the client with a
+  new value.
