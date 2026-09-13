@@ -61,6 +61,18 @@ from pqc_auth.dilithium import verify_with_public_key
 
 GENESIS_HASH = "0" * 64
 
+# Every non-oqs Signer backend anywhere in this project implements the
+# identical HMAC-SHA256(key=public_key, message=nonce) scheme --
+# tests/fake_signer.py::FakeSigner, pqc_auth/demo.py::_DemoFakeSigner, and
+# pqc_auth/live_loop.py::_DemoLoopSigner. They are separate, independently
+# defined classes (not one imported into the others -- pqc_auth/ never
+# imports tests/fake_signer.py, and demo.py/live_loop.py each carry their
+# own tiny copy rather than importing from each other), but they share one
+# verification scheme. A record whose "backend" field is any of these
+# names is checked with the HMAC reimplementation below; anything else
+# falls through to the real oqs-backed verify_with_public_key path.
+_HMAC_BACKED_BACKENDS = {"FakeSigner", "_DemoFakeSigner", "_DemoLoopSigner"}
+
 
 def _canonical_json(fields: dict) -> str:
     return json.dumps(fields, sort_keys=True, separators=(",", ":"))
@@ -130,9 +142,10 @@ def _check_signature(record: dict) -> tuple[bool, str]:
 
     backend = record.get("backend", "")
     try:
-        if backend == "FakeSigner":
-            # Independent reimplementation of tests/fake_signer.py's
-            # HMAC-SHA256 scheme -- deliberately not imported from there.
+        if backend in _HMAC_BACKED_BACKENDS:
+            # Independent reimplementation of the shared HMAC-SHA256
+            # scheme -- deliberately not imported from any of the classes
+            # that implement it (see _HMAC_BACKED_BACKENDS above).
             expected = hmac.new(public_key, nonce, hashlib.sha256).digest()
             crypto_valid = hmac.compare_digest(expected, signature)
         else:
