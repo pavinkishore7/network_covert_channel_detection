@@ -4,12 +4,21 @@ The policy is transport-agnostic: production code supplies a Dilithium signer
 and verification transport; tests use a deterministic fake signer.
 
 ``due()`` is the original scheduling decision (periodic vs. detector-triggered
-vs. not due yet) and is unchanged: it never touches a signer and always
-returns a bare ``ReauthReason | None``, so existing callers and tests keep
-working exactly as before. ``reauth()`` is new: it calls ``due()`` internally
-and, only when a ``signer`` was configured, additionally performs a real
-sign+verify round trip on a fresh per-call challenge, returning a
-``ReauthOutcome`` that wraps the same ``ReauthReason``.
+vs. not due yet); its default (``dry_run=False``) behavior is unchanged: it
+never touches a signer and always returns a bare ``ReauthReason | None``, so
+existing callers and tests keep working exactly as before. ``reauth()`` is
+new: it calls ``due()`` internally and, only when a ``signer`` was
+configured, additionally performs a real sign+verify round trip on a fresh
+per-call challenge, returning a ``ReauthOutcome`` that wraps the same
+``ReauthReason``.
+
+Both ``due()`` and ``reauth()`` also accept ``dry_run=True``, which answers
+the identical scheduling question without writing to this controller's
+internal state or (for ``reauth()``) calling the signer at all -- see
+``due()``'s own docstring for why this exists: it lets a single controller
+instance answer "would this fire" as many times as needed before an actual
+fire happens elsewhere, without needing a second controller kept in
+lockstep to ask the question safely.
 """
 
 from __future__ import annotations
@@ -102,17 +111,40 @@ class DualTriggerReauthController:
         self._last_reauth: dict[str, float] = {}
         self._last_alert: dict[str, float] = {}
 
-    def due(self, slice_type: str, now: float, detector_alert: bool = False) -> ReauthReason | None:
+    def due(self, slice_type: str, now: float, detector_alert: bool = False, dry_run: bool = False) -> ReauthReason | None:
+        """Decide whether ``slice_type`` is due for re-auth right now.
+
+        ``dry_run=False`` (the default, and the only behavior that existed
+        before it) is "decide AND commit": a due decision is recorded into
+        this controller's own scheduling state (``_last_reauth``/
+        ``_last_alert``) in the same call that reports it, which is why two
+        separate calls with identical arguments can produce different
+        answers -- the first one due changes what the second one sees.
+
+        ``dry_run=True`` answers the identical scheduling question --
+        computed with the exact same logic below, not an approximation --
+        WITHOUT writing to ``_last_reauth``/``_last_alert``. This is what
+        lets a caller ask "would this fire right now?" as many times as it
+        wants without affecting whether it actually would, and without
+        needing a second controller instance kept in lockstep to answer
+        the question safely (see ``pqc_auth/live_loop.py``, whose whole
+        point is asking this before deciding to actually fire over the
+        real transport).
+        """
         if slice_type not in self.policies:
             raise ValueError(f"Unknown slice type: {slice_type}")
         policy = self.policies[slice_type]
         last = self._last_reauth.get(slice_type)
-        if detector_alert and now - self._last_alert.get(slice_type, float("-inf")) >= policy.alert_cooldown_seconds:
-            self._last_alert[slice_type] = now
-            self._last_reauth[slice_type] = now
+        alert_due = detector_alert and now - self._last_alert.get(slice_type, float("-inf")) >= policy.alert_cooldown_seconds
+        if alert_due:
+            if not dry_run:
+                self._last_alert[slice_type] = now
+                self._last_reauth[slice_type] = now
             return ReauthReason.DETECTOR_ALERT
-        if last is None or now - last >= policy.interval_seconds:
-            self._last_reauth[slice_type] = now
+        periodic_due = last is None or now - last >= policy.interval_seconds
+        if periodic_due:
+            if not dry_run:
+                self._last_reauth[slice_type] = now
             return ReauthReason.PERIODIC
         return None
 
@@ -120,7 +152,7 @@ class DualTriggerReauthController:
         """Fresh, unpredictable per-call challenge: timestamp + slice_type + random token."""
         return f"{now}:{slice_type}:".encode() + secrets.token_bytes(16)
 
-    def reauth(self, slice_type: str, now: float, detector_alert: bool = False) -> ReauthOutcome | None:
+    def reauth(self, slice_type: str, now: float, detector_alert: bool = False, dry_run: bool = False) -> ReauthOutcome | None:
         """Like :meth:`due`, but when a signer is configured and re-auth is
         due, also performs a real sign+verify round trip on a fresh
         challenge and reports whether it actually verified.
@@ -129,11 +161,22 @@ class DualTriggerReauthController:
         returning ``None``). Never raises on a failed verification — the
         caller decides what a failed ``verified`` means for their flow;
         this method's job is only to report the true outcome.
+
+        ``dry_run=True`` passes through to :meth:`due` (so no scheduling
+        state is written) and additionally skips signing entirely -- the
+        signer is never called, matching the "no signing on a dry run"
+        requirement, since a dry run's whole point is answering "would
+        this fire" without any of the side effects firing actually has.
+        The returned ``ReauthOutcome`` still carries the real ``reason``
+        (``PERIODIC``/``DETECTOR_ALERT``) so a caller can act on WHY it
+        would fire without needing a separate code path; ``verified``,
+        ``nonce``, and ``signature`` are ``None``, the same shape already
+        used when no signer is configured at all.
         """
-        reason = self.due(slice_type, now, detector_alert=detector_alert)
+        reason = self.due(slice_type, now, detector_alert=detector_alert, dry_run=dry_run)
         if reason is None:
             return None
-        if self.signer is None:
+        if dry_run or self.signer is None:
             return ReauthOutcome(reason=reason, verified=None)
         nonce = self._challenge(slice_type, now)
         signature = self.signer.sign(nonce)

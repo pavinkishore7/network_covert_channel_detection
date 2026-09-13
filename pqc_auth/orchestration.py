@@ -44,6 +44,7 @@ def drive_reauth_from_detector_flags(
     anomaly_by_slice: dict[str, bool],
     controller: DualTriggerReauthController,
     now: float,
+    dry_run: bool = False,
 ) -> list[SliceReauthDecision]:
     """Call ``controller.reauth()`` for every slice in ``anomaly_by_slice``,
     passing that slice's flag as ``detector_alert``.
@@ -53,10 +54,21 @@ def drive_reauth_from_detector_flags(
     ``DualTriggerReauthController``'s existing scheduling semantics
     unchanged rather than reimplementing any interval or cooldown logic
     here.
+
+    ``dry_run=False`` is the original, only-ever-existing behavior: every
+    call here passes straight through to ``controller.reauth()`` with its
+    own default (``dry_run=False``), so nothing about existing callers
+    changes. ``dry_run=True`` passes that through instead, turning every
+    slice's decision into a "would this fire" query that touches neither
+    ``controller``'s scheduling state nor its signer — added for
+    ``pqc_auth/live_loop.py``, which needs to ask this question against
+    the SAME controller instance that a real ``ReauthServer`` answers
+    requests with, without that asking consuming the very re-auth window
+    it's asking about.
     """
     decisions: list[SliceReauthDecision] = []
     for slice_type, anomaly in anomaly_by_slice.items():
-        outcome = controller.reauth(slice_type, now, detector_alert=anomaly)
+        outcome = controller.reauth(slice_type, now, detector_alert=anomaly, dry_run=dry_run)
         if outcome is not None:
             decisions.append(SliceReauthDecision(slice_type=slice_type, outcome=outcome))
     return decisions

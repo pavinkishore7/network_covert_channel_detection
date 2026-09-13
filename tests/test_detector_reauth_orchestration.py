@@ -47,6 +47,24 @@ class DetectorReauthOrchestrationTests(unittest.TestCase):
         decisions = drive_reauth_from_detector_flags({"URLLC": False}, controller, 0)
         self.assertTrue(decisions[0].outcome.verified)
 
+    def test_dry_run_reports_the_decision_without_mutating_or_signing(self):
+        """pqc_auth/live_loop.py relies on exactly this passthrough to
+        query a single controller safely -- see reauth.py's dry_run
+        docstrings. Repeating the dry-run call must give the identical
+        answer, which would not hold if it silently mutated state."""
+        controller = DualTriggerReauthController(signer=FakeSigner())
+        for _ in range(3):
+            decisions = drive_reauth_from_detector_flags({"URLLC": False}, controller, 0, dry_run=True)
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual(decisions[0].outcome.reason, ReauthReason.PERIODIC)
+            self.assertIsNone(decisions[0].outcome.verified)  # never signed during a dry run
+
+        # The real call afterwards must still see the un-consumed window.
+        real_decisions = drive_reauth_from_detector_flags({"URLLC": False}, controller, 0)
+        self.assertEqual(len(real_decisions), 1)
+        self.assertEqual(real_decisions[0].outcome.reason, ReauthReason.PERIODIC)
+        self.assertTrue(real_decisions[0].outcome.verified)
+
 
 if __name__ == "__main__":
     unittest.main()
