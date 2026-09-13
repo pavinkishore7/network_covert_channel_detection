@@ -64,10 +64,17 @@ from pathlib import Path
 from pqc_auth.audit_verify import format_report, verify_log
 from pqc_auth.reauth import DualTriggerReauthController
 from pqc_auth.transport import ReauthClient, ReauthServer
+from pqc_auth.trust_store import TrustStore
 
 DEMO_STATE_DIR = Path(__file__).parent / ".demo_state"
 DEMO_KEY_DIR = DEMO_STATE_DIR / "oqs_key"
 DEMO_AUDIT_LOG_PATH = DEMO_STATE_DIR / "audit_log.jsonl"
+# Unlike DEMO_KEY_DIR/DEMO_AUDIT_LOG_PATH, this is reset at the start of
+# every demo run (see _demo_tofu_pinning) rather than persisted -- the
+# point of this section is to show FIRST CONTACT happening, which would
+# otherwise only be observable the very first time this demo is ever run.
+DEMO_TOFU_TRUST_STORE_PATH = DEMO_STATE_DIR / "tofu_trust_store.json"
+DEMO_TOFU_SERVER_ID = "pqc_auth-demo-server"
 
 
 class _DemoFakeSigner:
@@ -129,8 +136,72 @@ def _print_result(label: str, result) -> None:
     print(
         f"  [{label}] due=True reason={result.reason.value} "
         f"trusted={result.trusted} replay_rejected={result.rejected_as_replay} "
-        f"pinned_key_mismatch={result.pinned_key_mismatch}"
+        f"pinned_key_mismatch={result.pinned_key_mismatch} "
+        f"trust_store_key_changed={result.trust_store_key_changed}"
     )
+
+
+def _demo_tofu_pinning(server: ReauthServer, signer, verify_fn, backend_label: str) -> None:
+    """Trust-on-first-use (TOFU) pinning -- a DIFFERENT mechanism from the
+    expected_public_key pinning demonstrated in step 4 above. That client
+    was told the server's key in advance (caller-asserted). This one has
+    NEVER been told the key: it learns and pins whatever key it sees on
+    the first response for a given server_id, then holds it fixed after
+    that. See pqc_auth/trust_store.py and pqc_auth/README.md for what this
+    does and does NOT solve -- most importantly, an attacker already
+    present on this very first connection would be indistinguishable from
+    a legitimate one; nothing here proves the first key seen is correct.
+    """
+    print("\n5) Trust-on-first-use (TOFU) pinning -- distinct from step 4's expected_public_key:")
+    print("   this client has never been told the server's key in advance. It learns whichever")
+    print("   key it sees on first contact, persists it, and pins to it from then on.")
+
+    if DEMO_TOFU_TRUST_STORE_PATH.exists():
+        DEMO_TOFU_TRUST_STORE_PATH.unlink()  # reset every run so first contact is always observable
+
+    tofu_client = ReauthClient(
+        server.host, server.port, verify_fn=verify_fn,
+        trust_store_path=str(DEMO_TOFU_TRUST_STORE_PATH), server_id=DEMO_TOFU_SERVER_ID,
+        audit_log_path=str(DEMO_AUDIT_LOG_PATH),
+    )
+    # detector_alert=True bypasses mMTC's 300s periodic interval (mMTC was
+    # already touched earlier in this same demo run, at t=0, by step 3's
+    # _send_request -- relying on periodic timing here could show
+    # due=False depending on what ran before this function). The two calls
+    # are 100s apart, comfortably clearing the 10s alert_cooldown_seconds
+    # between them.
+    _print_result("TOFU  t=100 first contact              ", tofu_client.request_reauth("mMTC", 100, detector_alert=True))
+    _print_result("TOFU  t=200 same server again           ", tofu_client.request_reauth("mMTC", 200, detector_alert=True))
+
+    print("\n   Simulating the server's identity actually changing (a second, genuinely different signer,")
+    print("   answering under the SAME server_id):")
+    impersonator = _make_impersonator_signer(backend_label)
+    changed_controller = DualTriggerReauthController(signer=impersonator)
+    changed_server = ReauthServer(changed_controller)
+    changed_server.start()
+    try:
+        client_against_changed_server = ReauthClient(
+            changed_server.host, changed_server.port, verify_fn=verify_fn,
+            trust_store_path=str(DEMO_TOFU_TRUST_STORE_PATH), server_id=DEMO_TOFU_SERVER_ID,
+            audit_log_path=str(DEMO_AUDIT_LOG_PATH),
+        )
+        _print_result(
+            "TOFU  t=0   changed identity (rejected) ", client_against_changed_server.request_reauth("mMTC", 0)
+        )
+
+        print("\n   An operator explicitly accepts the rotation -- force_retrust() is never called automatically:")
+        TrustStore(DEMO_TOFU_TRUST_STORE_PATH).force_retrust(DEMO_TOFU_SERVER_ID, impersonator.public_key)
+        client_after_retrust = ReauthClient(
+            changed_server.host, changed_server.port, verify_fn=verify_fn,
+            trust_store_path=str(DEMO_TOFU_TRUST_STORE_PATH), server_id=DEMO_TOFU_SERVER_ID,
+            audit_log_path=str(DEMO_AUDIT_LOG_PATH),
+        )
+        _print_result(
+            "TOFU  t=1   after explicit re-trust     ",
+            client_after_retrust.request_reauth("mMTC", 1, detector_alert=True),
+        )
+    finally:
+        changed_server.stop()
 
 
 def main() -> None:
@@ -199,6 +270,8 @@ def main() -> None:
             f"this is a real signature, not a broken one)"
         )
         _print_result("eMBB  t=20 impersonator's key ", client.process_response(impersonated, now=20))
+
+        _demo_tofu_pinning(server, signer, verify_fn, backend_label)
     finally:
         server.stop()
 

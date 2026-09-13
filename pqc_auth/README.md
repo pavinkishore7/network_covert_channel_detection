@@ -79,18 +79,60 @@ only ever checks "is this signature genuine under the key attached to
 it", never "is this the key I actually meant to trust". Pinning closes
 that gap, but **only if `expected_public_key` was itself obtained through
 some trusted channel to begin with**. This project still ships **no
-key-distribution or certificate infrastructure of any kind**: nothing
-here proves that the bytes handed to `expected_public_key=` are the real
-server's key rather than an attacker's, verifies a certificate chain, or
-handles first-contact trust establishment ("trust on first use" and
-everything that implies is entirely out of scope). In the demo
-(`pqc_auth/demo.py`), the client is pinned to `signer.public_key` — i.e.
-the same process's own key, obtained in-process, which only proves the
-pinning *mechanism* works; it is not a demonstration of secure key
-distribution, because there is no separate, independent channel involved.
-Rotating a pinned key, or re-establishing trust after a server's identity
-legitimately changes, is not handled here either — see "What's still not
-done" below.
+certificate authority or signed-key-distribution scheme of any kind**:
+nothing here proves that the bytes handed to `expected_public_key=` are
+the real server's key rather than an attacker's, or verifies a
+certificate chain. In the demo (`pqc_auth/demo.py`), the client is pinned
+to `signer.public_key` — i.e. the same process's own key, obtained
+in-process, which only proves the pinning *mechanism* works; it is not a
+demonstration of secure key distribution, because there is no separate,
+independent channel involved. Rotating a pinned key, or re-establishing
+trust after a server's identity legitimately changes, is not handled by
+`expected_public_key` at all — see "What's still not done" below, and the
+trust-on-first-use subsection immediately below for the one thing this
+project does offer for a client that was never told the key in advance.
+
+### Trust-on-first-use (TOFU) pinning
+
+`ReauthClient(..., trust_store_path=..., server_id=...)` is a second,
+distinct mechanism (see `pqc_auth/trust_store.py`) for a client that has
+**never** been told the server's key in advance — the gap the previous
+paragraph left explicitly unsolved. Instead of a caller asserting the
+expected key up front, the client learns whichever key it sees on the
+**first** response for a given `server_id`, persists it to a plaintext
+JSON file (`{server_id: hex public key}`, same plaintext-on-disk,
+demo-grade convention as `dilithium.py`'s `key_path`), and pins to that
+learned key on every later response — checked before `verify_fn`, and
+never marking the nonce as seen on a mismatch, for the identical reasons
+as explicit pinning above. If both `expected_public_key` and
+`trust_store_path`/`server_id` are given, `expected_public_key` wins
+outright and the trust store isn't consulted: it's a stronger,
+caller-asserted guarantee, and silently falling back to a weaker
+mechanism underneath it would discard that.
+
+**(a) What this solves that plain `expected_public_key` pinning didn't:**
+there is now at least one code path for a client that starts with zero
+prior knowledge of the server's key to arrive at a trusted one on its own,
+the same trust model SSH uses for host keys — rather than requiring every
+caller to already have the key from somewhere else.
+
+**(b) What this explicitly does NOT solve:** an attacker already present
+on the path during the very **first-ever** connection to a given
+`server_id` is indistinguishable from a legitimate first contact. TOFU
+turns "do I trust this key" into "is this the same key I saw last time" —
+it defends against a server's identity being silently swapped out *after*
+a legitimate first connection, not against a hostile first connection.
+This is TOFU's own well-known limitation (SSH has the identical gap), not
+a shortcut taken in this implementation.
+
+**(c) No safe-rotation path:** a legitimate, intentional key rotation by
+the server looks **identical** to an attack under this scheme — both
+present a new key under an already-known `server_id`. Accepting either
+requires a human to call `TrustStore.force_retrust()` explicitly; nothing
+here tries to distinguish "this is probably a planned rotation" from "this
+is probably an attack," and no such heuristic is planned. Certificate
+authorities, revocation, and rotation-with-continuity are all explicitly
+out of scope for this project, not partially-solved.
 
 **`demo.py`** — `python -m pqc_auth.demo` (see below).
 
@@ -144,9 +186,16 @@ Starts a `ReauthServer` and `ReauthClient` on `127.0.0.1` (an OS-assigned
 port) and prints a trace of: periodic re-auth, a detector alert firing
 re-auth early with the immediate repeat suppressed by cooldown, a
 tampered signature followed by a replay of a genuine message — both
-rejected independently by the client — and a public-key pinning rejection,
+rejected independently by the client — a public-key pinning rejection,
 where a second, different signer's genuinely valid signature (valid under
-its own key) is rejected purely because it isn't the pinned key. It
+its own key) is rejected purely because it isn't the pinned key, and a
+separate trust-on-first-use demonstration: a client with no prior
+knowledge of the server's key learns it on first contact, stays trusting
+across a second connection, rejects a simulated identity change under the
+same `server_id`, and accepts that new key only after an explicit
+re-trust call. The TOFU section resets its own trust-store file at the
+start of every run (unlike the persisted signer key / audit log) so first
+contact is observable every time, not just the very first run ever. It
 auto-detects `oqs` and prints which signer backend it actually used; no
 setup is required either way.
 
@@ -221,12 +270,17 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   keypair every construction. `FakeSigner`/`_DemoFakeSigner` were not
   touched -- `FakeSigner` already uses a fixed default HMAC key
   (`_DEFAULT_TEST_KEY`), so it was already trivially "persistent" across
-  runs with no code change needed. Nothing here handles key distribution
-  to already-connected clients or re-establishing trust after a restart
-  beyond loading the same keypair back.
-- **No key rotation policy.** A signer's key is fixed for its lifetime;
-  there is no rotation schedule, no revocation, and no way to signal "this
-  public key is no longer valid" to a client.
+  runs with no code change needed. This bullet is about the SERVER's own
+  identity surviving a restart; see the trust-on-first-use subsection
+  above for the separate question of how a CLIENT that was never told the
+  key in advance can arrive at one.
+- **No automatic key rotation policy.** A signer's key is fixed for its
+  lifetime; there is no rotation schedule and no way to signal "this
+  public key is no longer valid" to a client. `TrustStore.force_retrust()`
+  (see the trust-on-first-use subsection above) lets an operator
+  *manually* accept a new key for an already-known `server_id`, but there
+  is no automatic distinction between a legitimate rotation and an
+  attacker's key, and no revocation mechanism of any kind.
 - **The transport is localhost-only** and has not been run over the real
   network-namespace topology being built separately in this project. It
   proves the challenge-response and replay-rejection logic work over an
