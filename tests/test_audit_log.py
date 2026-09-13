@@ -142,6 +142,73 @@ class TamperDetectionTests(unittest.TestCase):
         )
 
 
+class PinningAuditTests(unittest.TestCase):
+    """(Task A.4/A.6) The server is backed by a DIFFERENT signer than the
+    client is pinned to, so the logged record's signature is genuinely
+    valid under its own recorded public_key while trusted=False and
+    rejected_as_replay=False -- exactly the case audit_verify's signature
+    check must not misjudge. Confirms the independent auditor reports
+    this as a correct, internally-consistent rejection (PASS), not a
+    false FAIL."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_path = Path(self._tmpdir.name) / "audit_log.jsonl"
+
+        self.pinned_signer = FakeSigner(key=b"pinned-identity-key-not-real-crypto")
+        self.other_signer = FakeSigner(key=b"a-totally-different-identity-key")
+        self.controller = DualTriggerReauthController(signer=self.other_signer)
+        self.server = ReauthServer(self.controller)
+        self.server.start()
+        self.client = ReauthClient(
+            self.server.host,
+            self.server.port,
+            verify_fn=FakeSigner.verify_with_public_key,
+            expected_public_key=self.pinned_signer.public_key,
+            audit_log_path=str(self.log_path),
+        )
+        self.addCleanup(self.server.stop)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_pinning_rejection_record_passes_independent_audit_as_a_correct_rejection(self):
+        result = self.client.request_reauth("URLLC", 0)
+        self.assertTrue(result.pinned_key_mismatch)
+
+        lines = self.log_path.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertTrue(record["pinned_key_mismatch"])
+        self.assertFalse(record["trusted"])
+        self.assertFalse(record["rejected_as_replay"])
+        # The recorded public_key really is the OTHER signer's -- and its
+        # signature really would verify, which is exactly why a naive
+        # "crypto_valid == trusted or rejected_as_replay" check would
+        # wrongly FAIL this record.
+        self.assertEqual(record["public_key"], self.other_signer.public_key.hex())
+
+        verification = verify_log(self.log_path)
+        self.assertTrue(verification.all_clean, [r.reasons for r in verification.records if not r.ok])
+        self.assertEqual(len(verification.records), 1)
+
+    def test_pinning_record_that_also_claims_trusted_is_still_caught_as_inconsistent(self):
+        """The new check is not a rubber stamp: an impossible record
+        (pinned_key_mismatch=True AND trusted=True) must still FAIL."""
+        self.client.request_reauth("URLLC", 0)
+        lines = self.log_path.read_text().splitlines()
+        record = json.loads(lines[0])
+        record["trusted"] = True  # contradicts pinned_key_mismatch=True; record_hash deliberately left stale
+        tampered_path = Path(self._tmpdir.name) / "tampered.jsonl"
+        tampered_path.write_text(json.dumps(record) + "\n")
+
+        verification = verify_log(tampered_path)
+        self.assertFalse(verification.all_clean)
+        reasons = verification.records[0].reasons
+        self.assertTrue(
+            any("pinned_key_mismatch=True but record also claims" in r for r in reasons),
+            reasons,
+        )
+
+
 class OqsKeyPersistenceIdentityTests(unittest.TestCase):
     """(Step 4.2) Only meaningful with real liboqs -- proves key_path
     persistence reloads the SAME signing identity, not just that a file

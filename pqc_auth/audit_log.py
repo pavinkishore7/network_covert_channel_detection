@@ -73,8 +73,15 @@ class AuditLogger:
         backend: str,
         trusted: bool,
         rejected_as_replay: bool,
+        pinned_key_mismatch: bool = False,
     ) -> dict:
-        """Append one record and return it as the dict that was written."""
+        """Append one record and return it as the dict that was written.
+
+        ``pinned_key_mismatch`` defaults to False so existing callers that
+        predate public-key pinning (pqc_auth/transport.py's
+        ReauthClient.expected_public_key) keep writing records of the same
+        shape without any change on their part.
+        """
         fields = {
             "seq": self._next_seq,
             "timestamp": time.time(),
@@ -86,6 +93,7 @@ class AuditLogger:
             "backend": backend,
             "trusted": bool(trusted),
             "rejected_as_replay": bool(rejected_as_replay),
+            "pinned_key_mismatch": bool(pinned_key_mismatch),
             "prev_hash": self._prev_line_hash,
         }
         record_hash = hashlib.sha256(canonical_json(fields).encode("utf-8")).hexdigest()

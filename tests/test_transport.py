@@ -98,6 +98,72 @@ class FakeSignerTransportTests(unittest.TestCase):
         self.assertFalse(replay_after_expiry.rejected_as_replay)
 
 
+class PublicKeyPinningTests(unittest.TestCase):
+    """The server is backed by a DIFFERENT signer than the one the client
+    is pinned to, so every response it sends genuinely, correctly verifies
+    -- just under the wrong key. Proves pinning rejects on the key alone,
+    not by piggybacking on a signature failure."""
+
+    def setUp(self):
+        self.pinned_signer = FakeSigner(key=b"pinned-identity-key-not-real-crypto")
+        self.other_signer = FakeSigner(key=b"a-totally-different-identity-key")
+        self.controller = DualTriggerReauthController(signer=self.other_signer)
+        self.server = ReauthServer(self.controller)
+        self.server.start()
+        self.client = ReauthClient(
+            self.server.host,
+            self.server.port,
+            verify_fn=FakeSigner.verify_with_public_key,
+            expected_public_key=self.pinned_signer.public_key,
+        )
+
+    def tearDown(self):
+        self.server.stop()
+
+    def test_pinning_rejects_a_genuinely_valid_signature_from_a_different_keypair(self):
+        captured = self.client._send_request("URLLC", 0, detector_alert=False)
+        nonce = bytes.fromhex(captured["nonce"])
+        signature = bytes.fromhex(captured["signature"])
+        public_key = bytes.fromhex(captured["public_key"])
+
+        # This is the OTHER signer's response, not the pinned one.
+        self.assertEqual(public_key, self.other_signer.public_key)
+        self.assertNotEqual(public_key, self.pinned_signer.public_key)
+        # And it is a perfectly genuine signature -- verify_fn alone, with
+        # no pinning, would accept it. Proves the rejection below isn't
+        # just piggybacking on a signature that would have failed anyway.
+        self.assertTrue(FakeSigner.verify_with_public_key(nonce, signature, public_key))
+
+        result = self.client.process_response(captured, now=0)
+        self.assertTrue(result.due)
+        self.assertFalse(result.trusted)
+        self.assertFalse(result.rejected_as_replay)
+        self.assertTrue(result.pinned_key_mismatch)
+
+    def test_pinning_rejection_does_not_consume_the_nonce(self):
+        captured = self.client._send_request("URLLC", 0, detector_alert=False)
+        result = self.client.process_response(captured, now=0)
+        self.assertTrue(result.pinned_key_mismatch)
+        self.assertNotIn(bytes.fromhex(captured["nonce"]), self.client._seen_nonces)
+
+    def test_response_from_the_correctly_pinned_key_is_still_trusted(self):
+        # Same client, but pointed at a server backed by the PINNED signer
+        # this time -- confirms pinning doesn't just reject everything.
+        matching_controller = DualTriggerReauthController(signer=self.pinned_signer)
+        matching_server = ReauthServer(matching_controller)
+        matching_server.start()
+        self.addCleanup(matching_server.stop)
+        matching_client = ReauthClient(
+            matching_server.host,
+            matching_server.port,
+            verify_fn=FakeSigner.verify_with_public_key,
+            expected_public_key=self.pinned_signer.public_key,
+        )
+        result = matching_client.request_reauth("URLLC", 0)
+        self.assertTrue(result.trusted)
+        self.assertFalse(result.pinned_key_mismatch)
+
+
 class DilithiumTransportTests(unittest.TestCase):
     """Same round trip, real OqsDilithiumSigner. Skipped, not failed, when
     liboqs isn't available -- see tests/test_dilithium.py."""

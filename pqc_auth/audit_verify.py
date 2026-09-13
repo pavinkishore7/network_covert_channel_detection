@@ -28,12 +28,19 @@ Three independent checks per record:
      record). Catches record deletion, reordering, or insertion, and any
      edit to an earlier record even if that edit's own record_hash was
      "fixed up" to be internally consistent.
-  3. Signature validity: recomputing whether the recorded
-     (nonce, signature, public_key) actually verifies, and confirming
-     that result agrees with what the record claims (``trusted`` or
-     ``rejected_as_replay`` -- a replayed record is expected to carry a
-     genuinely valid signature that was rejected for being a replay, not
-     an invalid one).
+  3. Trust-outcome consistency: what this actually checks depends on
+     whether the record is a pinning rejection --
+
+     - Not a pinning rejection (``pinned_key_mismatch`` false/absent):
+       recompute whether the recorded (nonce, signature, public_key)
+       actually verifies, and confirm that result agrees with what the
+       record claims (``trusted`` or ``rejected_as_replay`` -- a replayed
+       record is expected to carry a genuinely valid signature that was
+       rejected for being a replay, not an invalid one).
+     - A pinning rejection (``pinned_key_mismatch`` true): see
+       ``_check_signature``'s docstring below for why recomputed
+       cryptographic validity is deliberately NOT part of this check for
+       these records, and what is checked instead.
 """
 
 from __future__ import annotations
@@ -62,6 +69,43 @@ def _check_signature(record: dict) -> tuple[bool, str]:
     except (KeyError, ValueError) as exc:
         return False, f"malformed nonce/signature/public_key field: {exc}"
 
+    trusted = bool(record.get("trusted"))
+    rejected_as_replay = bool(record.get("rejected_as_replay"))
+    pinned_key_mismatch = bool(record.get("pinned_key_mismatch"))
+
+    if pinned_key_mismatch:
+        # Reasoning (Task A.4): ReauthClient.process_response() performs
+        # the pinning check BEFORE it ever calls verify_fn (see
+        # pqc_auth/transport.py) -- a pinning rejection means "this
+        # public_key is not the one I trust", a decision that is made
+        # without looking at whether a signature under that (wrong) key
+        # would itself validate. Consequently the (nonce, signature,
+        # public_key) triple recorded here MAY be a perfectly genuine
+        # signature from a real, just-not-expected, keypair -- there is no
+        # bug in that; it is exactly the scenario pinning exists to catch
+        # (e.g. a second, legitimate-in-its-own-right keypair impersonating
+        # the pinned identity). Recomputing crypto_valid and comparing it
+        # to trusted/rejected_as_replay -- the ordinary branch below -- is
+        # therefore the WRONG check for this record: it would compare an
+        # answer to a question the real client deliberately never asked,
+        # and a genuinely valid signature under the wrong key would then
+        # make this auditor report a false FAIL on a correctly-functioning
+        # pinning rejection (a real cost: false FAILs from an auditor
+        # train operators to stop trusting it, which defeats the point of
+        # having one). What this auditor CAN and does independently check
+        # for a pinned_key_mismatch record is the only invariant that
+        # actually follows from the client's logic: a pinning rejection is
+        # a rejection, full stop, so it must never ALSO claim to be
+        # trusted or accepted as a non-replay. That is checked here,
+        # deliberately without touching crypto_valid at all.
+        if trusted or rejected_as_replay:
+            return False, (
+                "pinned_key_mismatch=True but record also claims "
+                f"trusted={record.get('trusted')!r} rejected_as_replay={record.get('rejected_as_replay')!r} "
+                "-- a pinning rejection must not also be trusted or accepted as a replay"
+            )
+        return True, ""
+
     backend = record.get("backend", "")
     try:
         if backend == "FakeSigner":
@@ -74,7 +118,7 @@ def _check_signature(record: dict) -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001 - report any backend failure as a check failure
         return False, f"signature verification raised {type(exc).__name__}: {exc}"
 
-    expected_valid = bool(record.get("trusted")) or bool(record.get("rejected_as_replay"))
+    expected_valid = trusted or rejected_as_replay
     if crypto_valid != expected_valid:
         return False, (
             f"signature check mismatch: recomputed cryptographic validity={crypto_valid} "

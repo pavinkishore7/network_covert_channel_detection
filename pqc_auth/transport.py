@@ -31,6 +31,12 @@ rejects a repeat, even if the signature is still cryptographically valid
 (a captured, still-valid (nonce, signature, public_key) tuple must not work
 twice). See ReauthClient's docstring for the expiry-window reasoning.
 
+Public-key pinning: if ReauthClient is constructed with expected_public_key,
+a response carrying any other public_key is rejected BEFORE verify_fn is
+even called -- see ReauthClient's docstring and process_response() for why
+that ordering matters (a signature can be genuinely valid under the wrong
+key, so checking crypto validity first would ask the wrong question).
+
 What this does NOT do (see pqc_auth/README.md for the fuller list):
   - No production-grade connection handling: no retries, no timeouts beyond
     a plain socket timeout, no TLS-equivalent transport security -- the
@@ -158,6 +164,7 @@ class ClientVerificationResult:
     reason: ReauthReason | None = None
     trusted: bool | None = None
     rejected_as_replay: bool = False
+    pinned_key_mismatch: bool = False
     backend: str | None = None
 
 
@@ -170,6 +177,16 @@ class ReauthClient:
     Never trusts the server's own ReauthOutcome.verified field -- that
     field isn't even sent over the wire (see ReauthServer._handle_connection).
     Every trust decision here is made by calling verify_fn independently.
+
+    ``expected_public_key``, if set, pins the client to one specific
+    identity obtained through some trusted out-of-band channel (e.g.
+    read once from the server's own persisted key_path at deployment
+    time). It closes a gap that verify_fn alone cannot: a signature can be
+    perfectly valid and still be signed by the WRONG keypair -- verify_fn
+    only ever answers "is this a genuine signature under THIS public_key",
+    never "is this public_key the one I actually trust". See
+    process_response() for how a mismatch is handled, and pqc_auth/README.md
+    for what pinning does and does not solve.
     """
 
     def __init__(
@@ -177,6 +194,7 @@ class ReauthClient:
         host: str,
         port: int,
         verify_fn: Callable[[bytes, bytes, bytes], bool],
+        expected_public_key: bytes | None = None,
         replay_window_seconds: float = DEFAULT_REPLAY_WINDOW_SECONDS,
         timeout: float = 5.0,
         audit_log_path: str | None = None,
@@ -184,6 +202,7 @@ class ReauthClient:
         self.host = host
         self.port = port
         self._verify_fn = verify_fn
+        self._expected_public_key = expected_public_key
         self._replay_window_seconds = replay_window_seconds
         self._timeout = timeout
         self._seen_nonces: dict[bytes, float] = {}
@@ -223,6 +242,28 @@ class ReauthClient:
         public_key = bytes.fromhex(response["public_key"])
         backend = response.get("backend")
 
+        if self._expected_public_key is not None and public_key != self._expected_public_key:
+            # Pinning rejection -- checked BEFORE verify_fn is ever called,
+            # and deliberately independent of it. The whole point is that
+            # public_key itself is not the one this client trusts; whether
+            # a signature under that wrong key would itself verify is
+            # irrelevant (it very well might: this could be a real
+            # signature from a real, just-not-expected, keypair -- e.g. an
+            # impersonator with their own genuine keypair, or a
+            # misconfigured/rotated server). Calling verify_fn here would
+            # answer a question nobody asked. The nonce is NOT marked as
+            # seen: this response was never accepted, so a later response
+            # for the same nonce from the CORRECTLY pinned key must still
+            # be able to be accepted on its own merits.
+            self._log_verification(
+                response, reason, nonce, signature, public_key, backend,
+                trusted=False, rejected_as_replay=False, pinned_key_mismatch=True,
+            )
+            return ClientVerificationResult(
+                due=True, reason=reason, trusted=False, rejected_as_replay=False,
+                pinned_key_mismatch=True, backend=backend,
+            )
+
         self._prune_expired(now)
         if nonce in self._seen_nonces:
             self._log_verification(response, reason, nonce, signature, public_key, backend, trusted=False, rejected_as_replay=True)
@@ -245,6 +286,7 @@ class ReauthClient:
         *,
         trusted: bool,
         rejected_as_replay: bool,
+        pinned_key_mismatch: bool = False,
     ) -> None:
         if self._audit_logger is None:
             return
@@ -257,6 +299,7 @@ class ReauthClient:
             backend=backend or "",
             trusted=trusted,
             rejected_as_replay=rejected_as_replay,
+            pinned_key_mismatch=pinned_key_mismatch,
         )
 
     def _prune_expired(self, now: float) -> None:
