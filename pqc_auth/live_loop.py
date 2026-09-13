@@ -22,16 +22,20 @@ What this actually does:
      the eMBB target ``region_mask`` the calibration protocol requires) --
      see ``predict_window()``.
   3. Feeds that per-tick ``{"eMBB": bool}`` anomaly flag to
-     ``pqc_auth.orchestration.drive_reauth_from_detector_flags()`` against a
-     real, signer-equipped ``DualTriggerReauthController``, and -- for every
-     tick that decides re-auth is due -- performs a REAL, independent
-     verification round trip over an actual local TCP socket via
+     ``pqc_auth.orchestration.drive_reauth_from_detector_flags()``, called in
+     ``dry_run=True`` mode against a single, real, signer-equipped
+     ``DualTriggerReauthController`` -- the SAME instance the real
+     ``ReauthServer`` answers requests with -- purely to ask "would this
+     slice fire right now" without mutating anything or signing. Only when
+     that answer is yes does a REAL, independent verification round trip
+     happen over an actual local TCP socket via
      ``pqc_auth.transport.ReauthServer``/``ReauthClient`` (the client pinned
      to the signer's own public key, see pqc_auth/transport.py's
-     ``expected_public_key``). Every such attempt is logged to the same
-     ``pqc_auth.audit_log.AuditLogger`` JSONL mechanism used elsewhere in
-     this project. See ``run_live_loop()`` for exactly how the "decide" and
-     "verify over the wire" steps are kept from stepping on each other.
+     ``expected_public_key``); that real round trip is the one and only
+     place scheduling state actually changes and signing actually happens.
+     Every such attempt is logged to the same ``pqc_auth.audit_log.AuditLogger``
+     JSONL mechanism used elsewhere in this project. See ``run_live_loop()``
+     for the full reasoning.
   4. At the end, runs ``pqc_auth.audit_verify`` against the resulting log
      and prints its PASS/FAIL summary.
 
@@ -218,16 +222,18 @@ def run_live_loop(
     allowed to skip" test convention (see pqc_auth/README.md), independent
     of whether liboqs happens to be installed wherever tests run.
 
-    Two DualTriggerReauthController instances share one signer and are
-    driven in lockstep, on purpose (see the inline comment at the loop
-    below) -- one decides (in-process, via
-    drive_reauth_from_detector_flags(), exactly as
-    pqc_auth/orchestration.py already does elsewhere), the other backs the
-    real ReauthServer a real ReauthClient actually talks to over a real
-    socket. This is what lets EVERY due re-auth get a genuine, independent,
-    over-the-wire client verification without a second call to the SAME
-    controller instance for the SAME (slice_type, now) silently returning
-    "not due" the second time.
+    Exactly ONE DualTriggerReauthController instance exists for the whole
+    run -- the one wrapped by the real ReauthServer below. Each tick asks
+    that SAME instance a dry_run=True question via
+    drive_reauth_from_detector_flags() (see pqc_auth/orchestration.py):
+    "would this slice fire right now" -- which touches neither its
+    scheduling state nor its signer. Only when the answer is yes does
+    client.request_reauth() run, which is the one real, over-the-wire call
+    that reaches the server and triggers controller.reauth() there for
+    real (dry_run defaults to False), mutating state and signing exactly
+    once per actual fire. There is no second controller to keep in sync
+    and nothing to desync: the dry-run query and the real fire both read
+    and (respectively) leave alone / update the identical state.
 
     Returns ``(trace, audit_report)``: ``trace`` is one dict per tick (see
     the fields built below); ``audit_report`` is
@@ -269,21 +275,12 @@ def run_live_loop(
         ticks = len(test_rows)
     ticks = min(ticks, len(test_rows))
 
-    # Two separate controller instances sharing ONE signer, kept in
-    # lockstep by construction: decision_controller.reauth() (via
-    # drive_reauth_from_detector_flags) is called every tick and decides
-    # whether re-auth is due; server_controller (wrapped in the real
-    # ReauthServer) is only ever contacted -- over the real socket, via
-    # client.request_reauth() -- on the SAME ticks, with the SAME
-    # (slice_type, now, detector_alert). due()'s scheduling state
-    # (_last_reauth/_last_alert) only mutates on a call that actually
-    # fires, so the two controllers' histories of firing events are
-    # identical at every point in the run, and server_controller
-    # independently re-derives "due" (and re-signs, fresh) for real,
-    # rather than trusting decision_controller's already-computed outcome.
-    decision_controller = DualTriggerReauthController(signer=signer)
-    server_controller = DualTriggerReauthController(signer=signer)
-    server = ReauthServer(server_controller)
+    # A single controller instance, shared between the dry-run "would this
+    # fire" query below and the real ReauthServer it's wrapped in -- see
+    # this function's own docstring for why one instance is now enough
+    # (no lockstep to maintain, because there's only one history to keep).
+    controller = DualTriggerReauthController(signer=signer)
+    server = ReauthServer(controller)
     server.start()
     client = ReauthClient(
         server.host,
@@ -306,8 +303,12 @@ def run_live_loop(
             predicted_anomaly, score = predict_window(model, grid, mask, threshold)
 
             # The ONLY thing that drives the re-auth decision: the
-            # detector's own prediction for this tick's slice.
-            decisions = drive_reauth_from_detector_flags({MONITORED_SLICE: predicted_anomaly}, decision_controller, now)
+            # detector's own prediction for this tick's slice. This is a
+            # dry run -- it answers "would this fire" against `controller`
+            # without mutating its scheduling state or touching the signer.
+            decisions = drive_reauth_from_detector_flags(
+                {MONITORED_SLICE: predicted_anomaly}, controller, now, dry_run=True
+            )
 
             reauth_fired = False
             fired_reason = None
@@ -315,6 +316,11 @@ def run_live_loop(
             for decision in decisions:
                 reauth_fired = True
                 fired_reason = decision.outcome.reason.value
+                # The real fire: this round-trips to ReauthServer, which
+                # calls controller.reauth() for real (dry_run=False, its
+                # default) -- the one place state is mutated and signing
+                # happens, on the SAME controller instance the dry run
+                # above just queried.
                 client_result = client.request_reauth(decision.slice_type, now, detector_alert=predicted_anomaly)
 
             entry = {
