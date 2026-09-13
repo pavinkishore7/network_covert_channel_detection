@@ -10,6 +10,8 @@ that some file got written.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import tempfile
 import unittest
@@ -207,6 +209,50 @@ class PinningAuditTests(unittest.TestCase):
             any("pinned_key_mismatch=True but record also claims" in r for r in reasons),
             reasons,
         )
+
+
+class HmacBackedBackendNameTests(unittest.TestCase):
+    """Regression test for a pre-existing bug found while actually running
+    `python -m pqc_auth.live_loop` for real in this round (not introduced
+    by this round's dry_run/single-controller refactor, and not new: the
+    identical bug and fix were also found and applied independently in
+    the sibling key-distribution-tofu branch/PR #6, ported here since this
+    branch doesn't have that commit): audit_verify's HMAC dispatch only
+    recognized backend == "FakeSigner", so any other HMAC-backed backend
+    name (pqc_auth/demo.py's _DemoFakeSigner, pqc_auth/live_loop.py's
+    _DemoLoopSigner -- both separate classes implementing the identical
+    scheme) incorrectly fell through to the oqs-backed verification path
+    and failed with a RuntimeError, turning every non-oqs demo/live_loop
+    run's self-audit into a false FAIL."""
+
+    def _hmac_signed_record(self, backend: str, key: bytes) -> dict:
+        nonce = b"some-nonce-bytes"
+        signature = hmac.new(key, nonce, hashlib.sha256).digest()
+        fields = {
+            "seq": 0, "timestamp": 0.0, "slice_type": "URLLC", "reason": "periodic",
+            "nonce": nonce.hex(), "signature": signature.hex(), "public_key": key.hex(),
+            "backend": backend, "trusted": True, "rejected_as_replay": False,
+            "pinned_key_mismatch": False, "prev_hash": "0" * 64,
+        }
+        record_hash = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {**fields, "record_hash": record_hash}
+
+    def _assert_backend_name_recognized(self, backend: str) -> None:
+        record = self._hmac_signed_record(backend, b"a-demo-key")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "log.jsonl"
+            path.write_text(json.dumps(record) + "\n")
+            result = verify_log(path)
+        self.assertTrue(result.all_clean, [r.reasons for r in result.records if not r.ok])
+
+    def test_demo_fake_signer_backend_name_is_recognized_as_hmac(self):
+        self._assert_backend_name_recognized("_DemoFakeSigner")
+
+    def test_live_loop_demo_signer_backend_name_is_recognized_as_hmac(self):
+        self._assert_backend_name_recognized("_DemoLoopSigner")
+
+    def test_tests_fake_signer_backend_name_still_recognized_as_hmac(self):
+        self._assert_backend_name_recognized("FakeSigner")
 
 
 class OqsKeyPersistenceIdentityTests(unittest.TestCase):
