@@ -37,6 +37,17 @@ even called -- see ReauthClient's docstring and process_response() for why
 that ordering matters (a signature can be genuinely valid under the wrong
 key, so checking crypto validity first would ask the wrong question).
 
+Trust-on-first-use (TOFU) pinning: if ReauthClient is constructed with
+trust_store_path + server_id instead of expected_public_key, it learns and
+persists whichever key it sees on the FIRST response for that server_id
+(see pqc_auth/trust_store.py), then pins to that learned key on every
+later response, with the same before-verify_fn ordering and the same
+"don't mark the nonce as seen" behavior on a mismatch as explicit pinning.
+See pqc_auth/trust_store.py's module docstring for what TOFU does and does
+NOT solve -- it is not a substitute for real key distribution, and an
+attacker present on the very first connection to a never-before-seen
+server_id is indistinguishable from a legitimate first contact.
+
 What this does NOT do (see pqc_auth/README.md for the fuller list):
   - No production-grade connection handling: no retries, no timeouts beyond
     a plain socket timeout, no TLS-equivalent transport security -- the
@@ -57,6 +68,7 @@ from typing import Callable
 
 from pqc_auth.audit_log import AuditLogger
 from pqc_auth.reauth import DualTriggerReauthController, ReauthReason
+from pqc_auth.trust_store import TrustStore
 
 # How long the client remembers a nonce it has accepted, in the same units
 # as the `now` timestamps passed to reauth()/request_reauth(). Chosen to
@@ -165,6 +177,7 @@ class ClientVerificationResult:
     trusted: bool | None = None
     rejected_as_replay: bool = False
     pinned_key_mismatch: bool = False
+    trust_store_key_changed: bool = False
     backend: str | None = None
 
 
@@ -187,6 +200,21 @@ class ReauthClient:
     never "is this public_key the one I actually trust". See
     process_response() for how a mismatch is handled, and pqc_auth/README.md
     for what pinning does and does not solve.
+
+    ``trust_store_path`` + ``server_id``, given together instead of
+    ``expected_public_key``, switch to trust-on-first-use (TOFU): the
+    client learns and persists whichever key it sees on the first response
+    for that ``server_id`` (see pqc_auth/trust_store.py), then pins to it
+    thereafter.
+
+    Precedence when both are given: ``expected_public_key`` wins outright
+    and the trust store is not consulted at all. Reasoning: an explicit
+    ``expected_public_key`` is a stronger, caller-asserted guarantee --
+    someone already obtained that exact key through a channel they trust
+    -- whereas TOFU-learned trust is, by construction, only ever as good
+    as whatever showed up first over the wire. A caller who supplies both
+    has already done the stronger thing; falling back to the weaker
+    mechanism underneath it would silently discard that guarantee.
     """
 
     def __init__(
@@ -195,14 +223,24 @@ class ReauthClient:
         port: int,
         verify_fn: Callable[[bytes, bytes, bytes], bool],
         expected_public_key: bytes | None = None,
+        trust_store_path: str | None = None,
+        server_id: str | None = None,
         replay_window_seconds: float = DEFAULT_REPLAY_WINDOW_SECONDS,
         timeout: float = 5.0,
         audit_log_path: str | None = None,
     ):
+        if (trust_store_path is None) != (server_id is None):
+            raise ValueError("trust_store_path and server_id must be given together, or not at all")
         self.host = host
         self.port = port
         self._verify_fn = verify_fn
         self._expected_public_key = expected_public_key
+        self._server_id = server_id
+        # Only constructed (and only ever consulted) when expected_public_key
+        # is NOT set -- see the precedence note in this class's docstring.
+        self._trust_store = (
+            TrustStore(trust_store_path) if trust_store_path is not None and expected_public_key is None else None
+        )
         self._replay_window_seconds = replay_window_seconds
         self._timeout = timeout
         self._seen_nonces: dict[bytes, float] = {}
@@ -264,6 +302,35 @@ class ReauthClient:
                 pinned_key_mismatch=True, backend=backend,
             )
 
+        if self._trust_store is not None:
+            stored_key = self._trust_store.get_trusted_key(self._server_id)
+            if stored_key is None:
+                # First contact for this server_id: learn and persist the
+                # key. This does NOT skip verification below -- "I don't
+                # yet have an opinion on whether this key is the right
+                # one" only means the identity check passes trivially this
+                # one time, not that the signature stops needing to verify
+                # via verify_fn like every other response.
+                self._trust_store.trust_first_contact(self._server_id, public_key)
+            elif stored_key != public_key:
+                # TOFU-detected key change -- structurally the same "wrong
+                # key" rejection as explicit pinning above, for the same
+                # reasons: checked BEFORE verify_fn (a signature can be
+                # genuinely valid under the changed key, so crypto validity
+                # is the wrong question), and the nonce is NOT marked as
+                # seen (this response was never accepted, so a later
+                # response under the ORIGINALLY-trusted key must still be
+                # acceptable on its own merits).
+                self._log_verification(
+                    response, reason, nonce, signature, public_key, backend,
+                    trusted=False, rejected_as_replay=False, trust_store_key_changed=True,
+                )
+                return ClientVerificationResult(
+                    due=True, reason=reason, trusted=False, rejected_as_replay=False,
+                    trust_store_key_changed=True, backend=backend,
+                )
+            # else: stored_key == public_key -- matches, fall through.
+
         self._prune_expired(now)
         if nonce in self._seen_nonces:
             self._log_verification(response, reason, nonce, signature, public_key, backend, trusted=False, rejected_as_replay=True)
@@ -287,6 +354,7 @@ class ReauthClient:
         trusted: bool,
         rejected_as_replay: bool,
         pinned_key_mismatch: bool = False,
+        trust_store_key_changed: bool = False,
     ) -> None:
         if self._audit_logger is None:
             return
@@ -300,6 +368,7 @@ class ReauthClient:
             trusted=trusted,
             rejected_as_replay=rejected_as_replay,
             pinned_key_mismatch=pinned_key_mismatch,
+            trust_store_key_changed=trust_store_key_changed,
         )
 
     def _prune_expired(self, now: float) -> None:

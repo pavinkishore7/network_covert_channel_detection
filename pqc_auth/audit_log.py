@@ -74,13 +74,16 @@ class AuditLogger:
         trusted: bool,
         rejected_as_replay: bool,
         pinned_key_mismatch: bool = False,
+        trust_store_key_changed: bool = False,
     ) -> dict:
         """Append one record and return it as the dict that was written.
 
         ``pinned_key_mismatch`` defaults to False so existing callers that
         predate public-key pinning (pqc_auth/transport.py's
         ReauthClient.expected_public_key) keep writing records of the same
-        shape without any change on their part.
+        shape without any change on their part. ``trust_store_key_changed``
+        follows the identical convention for TOFU pinning
+        (pqc_auth/trust_store.py): existing callers/records are unaffected.
         """
         fields = {
             "seq": self._next_seq,
@@ -94,6 +97,7 @@ class AuditLogger:
             "trusted": bool(trusted),
             "rejected_as_replay": bool(rejected_as_replay),
             "pinned_key_mismatch": bool(pinned_key_mismatch),
+            "trust_store_key_changed": bool(trust_store_key_changed),
             "prev_hash": self._prev_line_hash,
         }
         record_hash = hashlib.sha256(canonical_json(fields).encode("utf-8")).hexdigest()

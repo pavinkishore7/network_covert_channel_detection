@@ -37,10 +37,15 @@ Three independent checks per record:
        record claims (``trusted`` or ``rejected_as_replay`` -- a replayed
        record is expected to carry a genuinely valid signature that was
        rejected for being a replay, not an invalid one).
-     - A pinning rejection (``pinned_key_mismatch`` true): see
+     - A pinning rejection (``pinned_key_mismatch`` true) OR a
+       TOFU-detected key change (``trust_store_key_changed`` true): see
        ``_check_signature``'s docstring below for why recomputed
        cryptographic validity is deliberately NOT part of this check for
-       these records, and what is checked instead.
+       these records, and what is checked instead. The two flags share
+       one check (see the comment at that branch) because they are the
+       same underlying category of record -- "this public_key is not the
+       one I trust" -- and differ only in HOW the client came to trust the
+       expected key, which this check has no reason to care about.
 """
 
 from __future__ import annotations
@@ -72,37 +77,54 @@ def _check_signature(record: dict) -> tuple[bool, str]:
     trusted = bool(record.get("trusted"))
     rejected_as_replay = bool(record.get("rejected_as_replay"))
     pinned_key_mismatch = bool(record.get("pinned_key_mismatch"))
+    trust_store_key_changed = bool(record.get("trust_store_key_changed"))
 
-    if pinned_key_mismatch:
-        # Reasoning (Task A.4): ReauthClient.process_response() performs
-        # the pinning check BEFORE it ever calls verify_fn (see
-        # pqc_auth/transport.py) -- a pinning rejection means "this
-        # public_key is not the one I trust", a decision that is made
-        # without looking at whether a signature under that (wrong) key
-        # would itself validate. Consequently the (nonce, signature,
-        # public_key) triple recorded here MAY be a perfectly genuine
-        # signature from a real, just-not-expected, keypair -- there is no
-        # bug in that; it is exactly the scenario pinning exists to catch
-        # (e.g. a second, legitimate-in-its-own-right keypair impersonating
-        # the pinned identity). Recomputing crypto_valid and comparing it
-        # to trusted/rejected_as_replay -- the ordinary branch below -- is
-        # therefore the WRONG check for this record: it would compare an
-        # answer to a question the real client deliberately never asked,
-        # and a genuinely valid signature under the wrong key would then
-        # make this auditor report a false FAIL on a correctly-functioning
-        # pinning rejection (a real cost: false FAILs from an auditor
+    if pinned_key_mismatch or trust_store_key_changed:
+        # Reasoning (Task A.4, extended for TOFU): ReauthClient.process_response()
+        # performs BOTH the explicit-pinning check and the TOFU key-change
+        # check BEFORE it ever calls verify_fn (see pqc_auth/transport.py)
+        # -- either one means "this public_key is not the one I trust", a
+        # decision made without looking at whether a signature under that
+        # (wrong) key would itself validate. Consequently the (nonce,
+        # signature, public_key) triple recorded here MAY be a perfectly
+        # genuine signature from a real, just-not-expected, keypair --
+        # there is no bug in that; it is exactly the scenario both
+        # mechanisms exist to catch (e.g. a second, legitimate-in-its-own-
+        # right keypair impersonating the trusted identity, or a server's
+        # identity genuinely changing under an already-known server_id).
+        # Recomputing crypto_valid and comparing it to
+        # trusted/rejected_as_replay -- the ordinary branch below -- is
+        # therefore the WRONG check for either kind of record: it would
+        # compare an answer to a question the real client deliberately
+        # never asked, and a genuinely valid signature under the wrong key
+        # would then make this auditor report a false FAIL on a correctly-
+        # functioning rejection (a real cost: false FAILs from an auditor
         # train operators to stop trusting it, which defeats the point of
-        # having one). What this auditor CAN and does independently check
-        # for a pinned_key_mismatch record is the only invariant that
-        # actually follows from the client's logic: a pinning rejection is
-        # a rejection, full stop, so it must never ALSO claim to be
-        # trusted or accepted as a non-replay. That is checked here,
-        # deliberately without touching crypto_valid at all.
+        # having one).
+        #
+        # pinned_key_mismatch and trust_store_key_changed are deliberately
+        # checked together, not with two copies of this reasoning: they
+        # are the SAME underlying category of record ("this public_key is
+        # not the one I trust") and differ only in how the client arrived
+        # at the key it trusted -- explicitly caller-asserted vs. learned
+        # on first contact -- which is irrelevant to what this auditor can
+        # independently verify. Two separate branches with the same logic
+        # would be two places to get this exact reasoning right (or wrong)
+        # instead of one; a future third "wrong key" mechanism should join
+        # this same branch rather than growing a third copy.
+        #
+        # What this auditor CAN and does independently check for either
+        # kind of record is the only invariant that actually follows from
+        # the client's logic: a "wrong key" rejection is a rejection, full
+        # stop, so it must never ALSO claim to be trusted or accepted as a
+        # non-replay. That is checked here, deliberately without touching
+        # crypto_valid at all.
         if trusted or rejected_as_replay:
             return False, (
-                "pinned_key_mismatch=True but record also claims "
-                f"trusted={record.get('trusted')!r} rejected_as_replay={record.get('rejected_as_replay')!r} "
-                "-- a pinning rejection must not also be trusted or accepted as a replay"
+                f"pinned_key_mismatch={pinned_key_mismatch!r} trust_store_key_changed={trust_store_key_changed!r} "
+                f"but record also claims trusted={record.get('trusted')!r} "
+                f"rejected_as_replay={record.get('rejected_as_replay')!r} "
+                "-- a 'wrong key' rejection must not also be trusted or accepted as a replay"
             )
         return True, ""
 
