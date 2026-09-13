@@ -26,3 +26,4 @@ results/dataset_snr.npy
 
 # pqc_auth demo-only state: plaintext keys + accumulated audit log, never committed
 pqc_auth/.demo_state/
+pqc_auth/.live_loop_state/
