@@ -40,13 +40,18 @@ key, so checking crypto validity first would ask the wrong question).
 Trust-on-first-use (TOFU) pinning: if ReauthClient is constructed with
 trust_store_path + server_id instead of expected_public_key, it learns and
 persists whichever key it sees on the FIRST response for that server_id
-(see pqc_auth/trust_store.py), then pins to that learned key on every
-later response, with the same before-verify_fn ordering and the same
-"don't mark the nonce as seen" behavior on a mismatch as explicit pinning.
-See pqc_auth/trust_store.py's module docstring for what TOFU does and does
-NOT solve -- it is not a substitute for real key distribution, and an
-attacker present on the very first connection to a never-before-seen
-server_id is indistinguishable from a legitimate first contact.
+(see pqc_auth/trust_store.py) -- but only once verify_fn has confirmed
+that first response's signature is genuinely valid under that key; a
+first-contact response that fails verification is never persisted, and
+leaves the trust store empty for this server_id so a later, genuine first
+response can still be accepted normally. Once a key is learned, the client
+pins to it on every later response, with the same before-verify_fn
+ordering and the same "don't mark the nonce as seen" behavior on a
+mismatch as explicit pinning. See pqc_auth/trust_store.py's module
+docstring for what TOFU does and does NOT solve -- it is not a substitute
+for real key distribution, and an attacker present on the very first
+connection to a never-before-seen server_id, WITH a validly signed
+response, is indistinguishable from a legitimate first contact.
 
 What this does NOT do (see pqc_auth/README.md for the fuller list):
   - No production-grade connection handling: no retries, no timeouts beyond
@@ -204,8 +209,9 @@ class ReauthClient:
     ``trust_store_path`` + ``server_id``, given together instead of
     ``expected_public_key``, switch to trust-on-first-use (TOFU): the
     client learns and persists whichever key it sees on the first response
-    for that ``server_id`` (see pqc_auth/trust_store.py), then pins to it
-    thereafter.
+    for that ``server_id`` that actually verifies (see
+    pqc_auth/trust_store.py) -- an unverified first response is never
+    persisted -- then pins to the learned key thereafter.
 
     Precedence when both are given: ``expected_public_key`` wins outright
     and the trust store is not consulted at all. Reasoning: an explicit
@@ -302,16 +308,23 @@ class ReauthClient:
                 pinned_key_mismatch=True, backend=backend,
             )
 
+        first_contact = False
         if self._trust_store is not None:
             stored_key = self._trust_store.get_trusted_key(self._server_id)
             if stored_key is None:
-                # First contact for this server_id: learn and persist the
-                # key. This does NOT skip verification below -- "I don't
-                # yet have an opinion on whether this key is the right
-                # one" only means the identity check passes trivially this
-                # one time, not that the signature stops needing to verify
-                # via verify_fn like every other response.
-                self._trust_store.trust_first_contact(self._server_id, public_key)
+                # First contact for this server_id: "I don't yet have an
+                # opinion on whether this key is the right one" only means
+                # the identity check passes trivially this one time -- it
+                # does NOT mean the signature stops needing to verify via
+                # verify_fn like every other response. Persisting the key
+                # is deferred until AFTER verify_fn confirms it below (see
+                # the trusted branch further down): persisting it here,
+                # unconditionally, would let an unsigned/forged first
+                # packet permanently poison the trust store for this
+                # server_id before the real server's genuine first
+                # response ever arrives, with no automatic recovery since
+                # force_retrust() is never called automatically.
+                first_contact = True
             elif stored_key != public_key:
                 # TOFU-detected key change -- structurally the same "wrong
                 # key" rejection as explicit pinning above, for the same
@@ -339,6 +352,11 @@ class ReauthClient:
         trusted = self._verify_fn(nonce, signature, public_key)
         if trusted:
             self._seen_nonces[nonce] = now
+            if first_contact:
+                # Only now, with a genuinely valid signature under this
+                # public_key confirmed, is it safe to learn and persist
+                # it as this server_id's trusted identity.
+                self._trust_store.trust_first_contact(self._server_id, public_key)
         self._log_verification(response, reason, nonce, signature, public_key, backend, trusted=trusted, rejected_as_replay=False)
         return ClientVerificationResult(due=True, reason=reason, trusted=trusted, rejected_as_replay=False, backend=backend)
 

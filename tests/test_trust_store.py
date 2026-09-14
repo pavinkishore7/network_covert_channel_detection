@@ -161,6 +161,60 @@ class ReauthClientTofuTests(unittest.TestCase):
         self.assertTrue(result.trusted)
         self.assertFalse(result.trust_store_key_changed)
 
+    def test_e_first_contact_with_an_invalid_signature_is_not_trusted_and_not_persisted(self):
+        """Regression test: process_response() used to call
+        trust_first_contact() unconditionally on the first response for a
+        server_id, before verify_fn ever ran -- so a forged or corrupted
+        first packet (no valid signature required) would permanently
+        poison the trust store, locking out the real server's later
+        genuine responses as spurious "key changed" rejections. A
+        tampered first-contact response must be rejected like any other
+        signature failure and must leave the trust store empty."""
+        client = self._client_against(self.server)
+        captured = client._send_request("URLLC", 0, detector_alert=False)
+        tampered = dict(captured)
+        tampered_sig = bytearray(bytes.fromhex(tampered["signature"]))
+        tampered_sig[0] ^= 0xFF
+        tampered["signature"] = tampered_sig.hex()
+
+        result = client.process_response(tampered, now=0)
+
+        self.assertTrue(result.due)
+        self.assertFalse(result.trusted)
+        # This must be an ordinary signature failure, not a spurious
+        # "key changed" rejection -- there was nothing stored yet to
+        # change from.
+        self.assertFalse(result.trust_store_key_changed)
+
+        store = TrustStore(self.trust_store_path)
+        self.assertIsNone(store.get_trusted_key(self.SERVER_ID))
+
+    def test_f_a_later_genuine_first_contact_still_succeeds_after_a_rejected_forged_one(self):
+        """Proves the fix doesn't just reject the forged packet -- it also
+        doesn't leave the trust store in a state that locks out the real
+        server's later, genuine first response."""
+        forging_client = self._client_against(self.server)
+        captured = forging_client._send_request("URLLC", 0, detector_alert=False)
+        tampered = dict(captured)
+        tampered_sig = bytearray(bytes.fromhex(tampered["signature"]))
+        tampered_sig[0] ^= 0xFF
+        tampered["signature"] = tampered_sig.hex()
+        forging_client.process_response(tampered, now=0)  # rejected, not persisted
+
+        # A later, genuine response for the same server_id (now=30, past
+        # the periodic interval the forged request already consumed on
+        # the real server-side controller) must be accepted as ordinary
+        # first contact, not rejected as a spurious key change.
+        real_client = self._client_against(self.server)
+        result = real_client.request_reauth("URLLC", 30)
+
+        self.assertTrue(result.due)
+        self.assertTrue(result.trusted)
+        self.assertFalse(result.trust_store_key_changed)
+
+        store = TrustStore(self.trust_store_path)
+        self.assertEqual(store.get_trusted_key(self.SERVER_ID), self.signer.public_key)
+
 
 if __name__ == "__main__":
     unittest.main()
