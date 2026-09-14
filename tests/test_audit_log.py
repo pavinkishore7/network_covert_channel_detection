@@ -20,6 +20,7 @@ from pathlib import Path
 from pqc_auth.audit_verify import verify_log
 from pqc_auth.reauth import DualTriggerReauthController
 from pqc_auth.transport import ReauthClient, ReauthServer
+from pqc_auth.trust_store import TrustStore
 
 from tests.fake_signer import FakeSigner
 
@@ -206,20 +207,98 @@ class PinningAuditTests(unittest.TestCase):
         self.assertFalse(verification.all_clean)
         reasons = verification.records[0].reasons
         self.assertTrue(
-            any("pinned_key_mismatch=True but record also claims" in r for r in reasons),
+            any("pinned_key_mismatch=True" in r and "but record also claims" in r for r in reasons),
+            reasons,
+        )
+
+
+class TofuAuditTests(unittest.TestCase):
+    """Mirrors PinningAuditTests above, for TOFU key-change rejections
+    instead of explicit-pinning rejections. The server is backed by a
+    DIFFERENT signer than the one already trusted in the trust store for
+    this server_id, so the logged record's signature is genuinely valid
+    under its own recorded public_key while trusted=False and
+    rejected_as_replay=False -- the same shape audit_verify's signature
+    check must not misjudge, now via trust_store_key_changed instead of
+    pinned_key_mismatch."""
+
+    SERVER_ID = "pqc-auth-test-tofu-server"
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_path = Path(self._tmpdir.name) / "audit_log.jsonl"
+        self.trust_store_path = Path(self._tmpdir.name) / "trust_store.json"
+
+        self.original_signer = FakeSigner(key=b"tofu-original-identity-key")
+        self.changed_signer = FakeSigner(key=b"tofu-changed-identity-key")
+
+        # Pre-populate the trust store as if a prior run already learned
+        # the original signer's key via first contact.
+        TrustStore(self.trust_store_path).trust_first_contact(self.SERVER_ID, self.original_signer.public_key)
+
+        self.controller = DualTriggerReauthController(signer=self.changed_signer)
+        self.server = ReauthServer(self.controller)
+        self.server.start()
+        self.client = ReauthClient(
+            self.server.host,
+            self.server.port,
+            verify_fn=FakeSigner.verify_with_public_key,
+            trust_store_path=str(self.trust_store_path),
+            server_id=self.SERVER_ID,
+            audit_log_path=str(self.log_path),
+        )
+        self.addCleanup(self.server.stop)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_tofu_key_change_rejection_record_passes_independent_audit_as_a_correct_rejection(self):
+        result = self.client.request_reauth("URLLC", 0)
+        self.assertTrue(result.trust_store_key_changed)
+
+        lines = self.log_path.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertTrue(record["trust_store_key_changed"])
+        self.assertFalse(record["pinned_key_mismatch"])
+        self.assertFalse(record["trusted"])
+        self.assertFalse(record["rejected_as_replay"])
+        # The recorded public_key really is the CHANGED signer's -- and its
+        # signature really would verify, which is exactly why a naive
+        # "crypto_valid == trusted or rejected_as_replay" check would
+        # wrongly FAIL this record.
+        self.assertEqual(record["public_key"], self.changed_signer.public_key.hex())
+
+        verification = verify_log(self.log_path)
+        self.assertTrue(verification.all_clean, [r.reasons for r in verification.records if not r.ok])
+        self.assertEqual(len(verification.records), 1)
+
+    def test_tofu_record_that_also_claims_trusted_is_still_caught_as_inconsistent(self):
+        """Not a rubber stamp: an impossible record (trust_store_key_changed=True
+        AND trusted=True) must still FAIL."""
+        self.client.request_reauth("URLLC", 0)
+        lines = self.log_path.read_text().splitlines()
+        record = json.loads(lines[0])
+        record["trusted"] = True  # contradicts trust_store_key_changed=True; record_hash deliberately left stale
+        tampered_path = Path(self._tmpdir.name) / "tampered.jsonl"
+        tampered_path.write_text(json.dumps(record) + "\n")
+
+        verification = verify_log(tampered_path)
+        self.assertFalse(verification.all_clean)
+        reasons = verification.records[0].reasons
+        self.assertTrue(
+            any("trust_store_key_changed=True" in r and "but record also claims" in r for r in reasons),
             reasons,
         )
 
 
 class HmacBackedBackendNameTests(unittest.TestCase):
-    """Regression test for a pre-existing bug found while actually running
-    `python -m pqc_auth.live_loop` for real in this round (not introduced
-    by this round's dry_run/single-controller refactor, and not new: the
-    identical bug and fix were also found and applied independently in
-    the sibling key-distribution-tofu branch/PR #6, ported here since this
-    branch doesn't have that commit): audit_verify's HMAC dispatch only
-    recognized backend == "FakeSigner", so any other HMAC-backed backend
-    name (pqc_auth/demo.py's _DemoFakeSigner, pqc_auth/live_loop.py's
+    """Regression test for a pre-existing bug found independently twice,
+    in two separate rounds of work, neither introduced by that round's
+    own changes: once while actually running `python -m pqc_auth.live_loop`
+    for real (on the live-loop-single-controller branch/PR #7), and once
+    while running `python -m pqc_auth.demo` for real (on this branch/PR
+    #6). audit_verify's HMAC dispatch only recognized
+    backend == "FakeSigner", so any other HMAC-backed backend name
+    (pqc_auth/demo.py's _DemoFakeSigner, pqc_auth/live_loop.py's
     _DemoLoopSigner -- both separate classes implementing the identical
     scheme) incorrectly fell through to the oqs-backed verification path
     and failed with a RuntimeError, turning every non-oqs demo/live_loop
@@ -232,7 +311,8 @@ class HmacBackedBackendNameTests(unittest.TestCase):
             "seq": 0, "timestamp": 0.0, "slice_type": "URLLC", "reason": "periodic",
             "nonce": nonce.hex(), "signature": signature.hex(), "public_key": key.hex(),
             "backend": backend, "trusted": True, "rejected_as_replay": False,
-            "pinned_key_mismatch": False, "prev_hash": "0" * 64,
+            "pinned_key_mismatch": False, "trust_store_key_changed": False,
+            "prev_hash": "0" * 64,
         }
         record_hash = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return {**fields, "record_hash": record_hash}
