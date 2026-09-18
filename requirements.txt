@@ -14,6 +14,12 @@ scikit-learn
 # then pip install this. It will fail otherwise.
 liboqs-python
 
+# Network-layer covert channel (network_covert_channel/) — packet crafting
+# and pcap parsing. iperf3/tshark/tcpdump are used via subprocess when
+# present on the host but are not Python deps; see
+# network_covert_channel/README.md for what's actually available where.
+scapy
+
 # Dashboard
 streamlit
 plotly
