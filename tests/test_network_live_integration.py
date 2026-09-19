@@ -33,7 +33,7 @@ import unittest
 import numpy as np
 import pytest
 
-from network_covert_channel.capture import parse_pcap_to_dataframe, pcap_filename
+from network_covert_channel.capture import build_capture_cmd, parse_pcap_to_dataframe, pcap_filename, preferred_capture_tool
 from network_covert_channel.topology import NetnsTopology
 from network_covert_channel.traffic import build_traffic_plan, send_traffic_plan
 from slicing_sim.ofdm_grid import SLICE_TYPES
@@ -48,9 +48,16 @@ class LiveTopologyDemoTest(unittest.TestCase):
     run without them, rather than failing confusingly mid-setup."""
 
     def setUp(self):
-        probe = subprocess.run(
-            ["ip", "netns", "add", "__ncc_priv_probe__"], capture_output=True, text=True
-        )
+        try:
+            probe = subprocess.run(
+                ["ip", "netns", "add", "__ncc_priv_probe__"], capture_output=True, text=True
+            )
+        except OSError as exc:
+            # `ip` itself isn't on PATH at all -- a different, earlier
+            # failure than "found ip but lack CAP_NET_ADMIN" (below), and
+            # worth telling apart in the skip message: one means "install
+            # iproute2", the other means "run as root/with the capability".
+            self.skipTest(f"requires the 'ip' binary (iproute2), not found on PATH ({exc})")
         if probe.returncode != 0:
             self.skipTest(
                 "requires root/CAP_NET_ADMIN to create network namespaces "
@@ -62,6 +69,10 @@ class LiveTopologyDemoTest(unittest.TestCase):
         self.addCleanup(self.topo.teardown)
 
     def test_three_slices_produce_distinguishable_timing_distributions(self):
+        capture_tool = preferred_capture_tool()
+        if capture_tool is None:
+            self.skipTest("requires tshark or tcpdump on PATH to capture traffic; neither was found")
+
         self.topo.setup()
 
         pcap_paths = {}
@@ -78,12 +89,24 @@ class LiveTopologyDemoTest(unittest.TestCase):
                 rng=rng,
             )
 
-            cmd = ["tshark", "-i", host_if, "-w", pcap_paths[slice_type], "-a", f"duration:{CAPTURE_DURATION_S}"]
+            cmd = build_capture_cmd(capture_tool, host_if, pcap_paths[slice_type], duration_s=CAPTURE_DURATION_S)
             capture_handle = subprocess.Popen(cmd)
-            time.sleep(1)  # let tshark attach before traffic starts
+            time.sleep(1)  # let the capture tool attach before traffic starts
 
             send_traffic_plan(plan, iface=host_if)
-            capture_handle.wait(timeout=CAPTURE_DURATION_S + 10)
+            try:
+                capture_handle.wait(timeout=CAPTURE_DURATION_S + 10)
+            except subprocess.TimeoutExpired:
+                # build_capture_cmd only gives tshark a self-stop flag
+                # (`-a duration:N`); tcpdump has no equivalent (see
+                # capture.py's run_capture docstring), so if
+                # preferred_capture_tool() picked tcpdump here it will
+                # still be running at this point -- make sure it doesn't
+                # leak as a background process now that this path is
+                # reachable (it never was while the tool was hardcoded to
+                # tshark, which always self-terminates).
+                capture_handle.kill()
+                capture_handle.wait()
 
         distributions = {}
         for slice_type, path in pcap_paths.items():
