@@ -162,6 +162,36 @@ class SetupTeardownExecutionTests(unittest.TestCase):
         # The bridge delete (part of teardown) must have been attempted.
         self.assertIn(["ip", "link", "delete", topo.bridge_name], runner.calls)
 
+    def test_setup_failure_from_a_missing_binary_triggers_rollback_teardown(self):
+        """Regression test: a missing binary partway through setup() (e.g.
+        `tc` absent while `ip` is present -- a real partial-toolchain
+        scenario) used to raise a bare FileNotFoundError straight out of
+        _execute(), which setup()'s `except TopologyCommandError` did not
+        catch -- so teardown() never ran and whatever namespaces/veths/
+        bridge got created before the crash were orphaned. This proves
+        both halves: (a) setup() raises TopologyCommandError, not a raw
+        OSError/FileNotFoundError, and (b) teardown was actually invoked
+        as a result -- the same two things
+        test_setup_failure_triggers_rollback_teardown already proves for
+        a nonzero exit code, which is a different code path in
+        _execute() from the one this test exercises."""
+
+        class MissingBinaryRunner(FakeRunner):
+            def __call__(self, argv):
+                self.calls.append(argv)
+                if argv[0] == "tc":
+                    raise FileNotFoundError(2, "No such file or directory", "tc")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+        runner = MissingBinaryRunner()
+        topo = NetnsTopology(runner=runner)
+        with self.assertRaises(TopologyCommandError):
+            topo.setup()
+        # The bridge delete (part of teardown) must have been attempted,
+        # proving teardown() actually ran rather than the FileNotFoundError
+        # escaping past setup()'s except clause uncaught.
+        self.assertIn(["ip", "link", "delete", topo.bridge_name], runner.calls)
+
     def test_teardown_never_raises_even_if_runner_itself_raises(self):
         def exploding_runner(argv):
             raise OSError("no such command")

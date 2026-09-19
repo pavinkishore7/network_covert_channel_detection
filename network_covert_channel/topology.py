@@ -284,7 +284,23 @@ class NetnsTopology:
 
     def _execute(self, cmds: list[list[str]]) -> None:
         for argv in cmds:
-            result = self._run(argv)
+            try:
+                result = self._run(argv)
+            except OSError as exc:
+                # The binary itself doesn't exist or can't be executed
+                # (FileNotFoundError, PermissionError, ...) -- raised by
+                # the runner before there is any CompletedProcess/returncode
+                # to check, so it needs its own conversion into
+                # TopologyCommandError here rather than falling into the
+                # returncode check below. Without this, setup()'s
+                # `except TopologyCommandError: self.teardown(); raise`
+                # never fires for a missing binary, and whatever
+                # namespaces/veths/bridge a partial run already created are
+                # orphaned -- exactly the crash this module's own setup()
+                # docstring claims can't happen.
+                raise TopologyCommandError(
+                    f"command failed (could not execute {argv[0]!r}): {' '.join(argv)}\n{exc}"
+                ) from exc
             if result.returncode != 0:
                 raise TopologyCommandError(
                     f"command failed (exit {result.returncode}): {' '.join(argv)}\n"
