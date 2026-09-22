@@ -11,16 +11,18 @@ The two packages are kept structurally separate on purpose: apart from
 both being framed around the same three network slices, they share no code
 and no threat model.
 
-**Phase 1 scope — this package only. This is topology + traffic generation
-+ capture infrastructure. It does NOT include:**
-- the covert channel injection itself (encoding bits into inter-packet
-  timing),
-- a detector,
-- wiring into the PQC re-auth handshake in `pqc_auth/`.
+**Phase 1 (topology + traffic generation + capture infrastructure) is
+complete and merged to `master`.** It provides `NetnsTopology`,
+`traffic.py`'s per-slice packet generation, and `capture.py`'s
+capture/parsing utilities — no covert channel and no detector yet.
 
-Those are separate follow-up phases once this lands and is reviewed —
-deliberately, to avoid landing too much new surface (real namespaces, real
-subprocess calls, real packet I/O) in one commit.
+**Phase 2 (this package's `covert_injector.py`, `timing_detector.py`, and
+`covert_demo.py`) adds the timing covert channel itself and a classical
+statistical detector for it.** See "Phase 2: covert channel + classical
+detector" below for the design, the actual measured detection accuracy,
+and what Phase 2 deliberately still does NOT do (wiring into the PQC
+re-auth handshake in `pqc_auth/` — that remains a separate follow-up
+phase, to avoid landing too much new surface in one change).
 
 Note on project scope: `docs/DECISIONS.md` records a 2026-07 decision that
 narrowed this project's *novelty claim* to the PHY-layer OFDM channel
@@ -118,14 +120,126 @@ setup.
   pcap built and written with scapy in the test itself — no live capture
   needed to verify it.
 
-## Phase 2 will need
+## Phase 2: covert channel + classical detector
 
-- A way to inject bits into `traffic.py`'s inter-packet gaps (the covert
-  encoding itself) without breaking the per-slice timing signature this
-  phase established as the baseline "normal."
-- A classical/statistical or ML-but-not-CNN detector operating on
-  `capture.py`'s parsed timing DataFrame (this is why the DataFrame format
-  was kept simple and generic rather than image-shaped).
-- Eventually, wiring a detector alert from this vector into
-  `pqc_auth.reauth.DualTriggerReauthController`, the same way
+**Scope: `covert_injector.py` (the covert channel), `timing_detector.py`
+(the detector), and `covert_demo.py` (end-to-end composition + live
+path). Does NOT include wiring a detector alert into
+`pqc_auth.reauth.DualTriggerReauthController` — that is Phase 3, see
+"Phase 3 will need" below. Nothing in `pqc_auth/` or `detector/` is
+touched by Phase 2.**
+
+### The covert channel (`covert_injector.py`)
+
+One hidden bit per packet, encoded as an additive delay on that packet's
+inter-packet gap: bit=0 sends the clean gap unperturbed; bit=1 adds a
+fixed offset (`offset_s`) on top of whatever `traffic.py`'s
+`generate_inter_packet_gaps` already produced. `NonAdaptiveCovertInjector`
+uses the same offset everywhere; `AdaptiveCovertInjector` shrinks the
+offset when the slice's own local jitter (a causal rolling stdev) is
+already high, capped at the non-adaptive offset as a ceiling — mirroring
+`covert_channel/attacker.py`'s `NonAdaptiveAttacker`/`AdaptiveAttacker`
+split. See the module docstring for the full channel-capacity-vs.
+-detectability reasoning (short version: a fixed absolute offset is far
+more visible on `URLLC`, whose low burstiness keeps its natural gap
+spread tight, than on `mMTC`, whose high burstiness gives it much more
+room to hide in).
+
+### The detector (`timing_detector.py`)
+
+`TimingKSDetector` — a two-sample Kolmogorov-Smirnov test
+(`scipy.stats.ks_2samp`) comparing an observed inter-packet-gap sample
+against a clean baseline sample for the same slice. Chosen deliberately
+over the CNN autoencoder (`detector/autoencoder_detector.py`):
+inter-packet-gap series are 1-D, not the 2-D image-shaped grids that
+detector's Conv2D layers are built for, and using a different method here
+is also a legitimate point of comparison for the report — does a
+network-layer timing channel need a CNN to see, or does a much simpler
+classical test already catch it? KS was chosen over chi-squared (avoids a
+binning choice) and a z-score-of-variance score (would miss the
+mean-shift this injector's encoding actually produces). Threshold
+calibration mirrors `AutoencoderDetector.calibrate()`'s
+percentile-of-clean-tail convention: `calibrate()` draws many independent
+clean-vs-clean pairs to build a null distribution of the KS D statistic
+and sets the threshold at its 95th percentile, so the false-positive rate
+is explicit rather than assumed.
+
+`anomaly_by_slice()` returns `dict[str, bool]` — checked (not wired in)
+against `pqc_auth.orchestration.drive_reauth_from_detector_flags`'s
+expected input shape via a compatibility test
+(`tests/test_network_timing_detector.py::OrchestrationCompatibilityTests`)
+that calls it directly with `dry_run=True`. The shapes line up with no
+adaptation needed; nothing in `pqc_auth/` is imported outside that one
+test, and nothing there is modified.
+
+### Measured detection accuracy (synthetic, this session's actual run)
+
+Produced by `python -m network_covert_channel.covert_demo` (300 packets/
+trial, 30 independent trials per cell, threshold calibrated at the 95th
+percentile of 100 clean-vs-clean trials) — reproducible, not hand-picked:
+
+| Slice | False-alarm rate (clean-vs-clean) | 20ms offset (large) | 4ms offset (moderate) | 0.6ms offset (marginal) |
+|-------|-----------------------------------|----------------------|--------------------------|----------------------------|
+| URLLC | 6.67%  | 100.00% | 100.00% | 100.00% |
+| eMBB  | 10.00% | 100.00% | 100.00% | 83.33%  |
+| mMTC  | 6.67%  | 100.00% | 100.00% | 40.00%  |
+
+**The honest finding is the marginal (0.6ms) column, not the large/
+moderate ones.** At a large enough offset, the KS detector catches the
+covert channel reliably on every slice — that part isn't surprising. What
+*is* worth reporting is that the same small absolute offset is
+meaningfully less detectable on `mMTC` (burstiness=0.8, wide natural gap
+spread swallows a 0.6ms shift) than on `URLLC` (burstiness=0.2, tight
+natural spread makes the same shift stand out more). This is not a fixed
+property of the detector alone — it is a property of how much cover the
+carrier traffic's own natural jitter provides, and it varies by slice.
+`tests/test_network_timing_detector.py`'s `DetectionAccuracyTests`
+encodes this as an assertion (a different, seed-swept measurement that
+also confirms mMTC's marginal-offset detection rate stays below URLLC's),
+not just a one-off demo run — the numbers above and the numbers in that
+test file's docstring differ slightly (different seeds/trial counts) but
+tell the same qualitative story.
+
+A real clean-vs-covert gap-distribution comparison, generated from an
+actual run of `covert_demo.plot_clean_vs_covert` against real synthetic
+gap arrays at the 4ms offset (not mocked or fabricated):
+`results/network_covert_channel_phase2_gap_distributions.png`.
+
+### Live verification status (stated plainly, same standard as Phase 1)
+
+**Live (real-topology) verification did NOT happen for Phase 2, same as
+Phase 1.** Privilege check re-verified fresh in this session
+(2026-09-22, same WSL2 dev environment):
+```
+$ id -u
+1000
+$ ip netns add __ncc_phase2_probe__
+mkdir /run/netns failed: Permission denied
+$ sudo -n true
+sudo: a password is required
+$ which tcpdump tshark ip
+/usr/sbin/ip
+```
+No root/CAP_NET_ADMIN, no passwordless sudo, and neither `tshark` nor
+`tcpdump` is on PATH. `covert_demo.run_live_demo()` and
+`tests/test_network_covert_live_integration.py` are written and ready but
+were not exercised against a real kernel this session — the live test
+self-skips with the exact message above (via `netns_privileges_available()`)
+rather than failing confusingly mid-setup, exactly like Phase 1's live
+test already does. Everything reported above is from the synthetic
+(in-memory) path only.
+
+## Phase 3 will need
+
+- Wiring a detector alert from `timing_detector.TimingKSDetector.anomaly_by_slice()`
+  into `pqc_auth.reauth.DualTriggerReauthController` via
+  `pqc_auth.orchestration.drive_reauth_from_detector_flags`, the same way
   `pqc_auth/live_loop.py` already wires the PHY-layer detector's alerts in.
+  Phase 2 checked (see above) that the output shape is already compatible;
+  Phase 3 is the actual wiring, plus deciding how this vector's alerts
+  should interact with the PHY-layer vector's alerts on a slice that both
+  could fire on.
+- Actual live-topology verification, once run on a host with root/
+  CAP_NET_ADMIN and a real Linux kernel (this project's dev environment
+  still doesn't have either, per both Phase 1's and Phase 2's privilege
+  checks above).
