@@ -1,0 +1,147 @@
+"""
+Phase 2, step 2: a classical (non-neural) statistical detector for the
+network-layer timing covert channel injected by covert_injector.py.
+
+Deliberately NOT the CNN autoencoder in detector/autoencoder_detector.py.
+Reasons, stated plainly per this project's habit of justifying every
+architecture choice rather than asserting it:
+  - Inter-packet-gap series are 1-D (one float per packet), not the 2-D
+    (n_symbols, n_subcarriers) image-shaped grids AutoencoderDetector's
+    Conv2D encoder/decoder is built for. Reshaping a 1-D timing series to
+    look image-shaped just to reuse that architecture would be an
+    artificial fit, not a real one.
+  - This is also a legitimate point of comparison for the report: the
+    PHY-layer channel needed a CNN to see a 2-D structural anomaly; does a
+    1-D network-layer timing channel need one too, or does a much simpler
+    classical test already catch it? Using a different method here makes
+    that a real, answerable question instead of assuming the same tool
+    fits both.
+
+Method chosen: two-sample Kolmogorov-Smirnov (KS) test
+(``scipy.stats.ks_2samp``) comparing an OBSERVED inter-packet-gap sample
+against a CLEAN baseline sample for the same slice.
+
+Why KS over the other candidates the Phase 2 prompt named:
+  - chi-squared needs a binning choice (bin width/count) that changes the
+    test's sensitivity in ways that are hard to justify a priori for a
+    gap distribution that is already a burstiness-weighted blend of two
+    different component shapes (see traffic.py's module docstring) --
+    KS avoids binning entirely by comparing empirical CDFs directly.
+  - a z-score-of-gap-variance anomaly score is cheap but blind to a shift
+    that leaves variance roughly unchanged. covert_injector.py's encoding
+    is an additive MEAN shift on ~half the packets (bit=1 ones), which can
+    leave the perturbed sample's variance close to the clean sample's
+    variance while still shifting its distribution -- a variance-only
+    score would systematically miss exactly the signal this covert
+    channel produces, especially at the smaller offsets. KS compares
+    the full empirical CDF, so it is sensitive to a mean shift, a
+    variance change, or a shape change alike, without having to guess in
+    advance which one the attack will produce.
+  - entropy/regularity measures were also considered; rejected as harder
+    to calibrate a principled false-positive rate for than a
+    distribution-comparison test that already has a standard statistic.
+
+Threshold calibration mirrors detector.autoencoder_detector's
+percentile-of-clean-tail convention (see its ``calibrate()``) rather than
+a textbook fixed significance level: ``calibrate()`` here draws many
+independent PAIRS of clean baseline samples for the same slice/generator
+and builds a null distribution of the KS D statistic between them, then
+sets ``threshold_`` at its ``percentile``-th percentile. percentile=95
+means ~5% of clean-vs-clean comparisons will be flagged anomalous BY
+CONSTRUCTION -- report that alongside any detection-rate number, exactly
+as autoencoder_detector.py's calibrate() docstring insists for its own
+threshold.
+
+Output shape: ``anomaly_by_slice`` returns ``dict[str, bool]`` --
+deliberately the exact type ``pqc_auth.orchestration
+.drive_reauth_from_detector_flags`` already accepts as its
+``anomaly_by_slice`` parameter. This module was checked against that
+signature (pqc_auth/orchestration.py, read as part of writing this
+module) specifically so the shape lines up; it is NOT wired into
+drive_reauth_from_detector_flags or DualTriggerReauthController anywhere
+in this change -- that integration is explicitly left for a later phase
+(see network_covert_channel/README.md and this PR's description).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+from scipy.stats import ks_2samp
+
+
+@dataclass(frozen=True)
+class KSDetectionResult:
+    statistic: float
+    anomaly: bool
+
+
+class TimingKSDetector:
+    """Two-sample KS-test anomaly detector over inter-packet-gap samples.
+    See module docstring for the full method justification and the
+    calibration convention this mirrors from AutoencoderDetector."""
+
+    def __init__(self, seed: int | None = None):
+        self.rng = np.random.default_rng(seed)
+        self.threshold_: float | None = None
+
+    def statistic(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> float:
+        """The KS D statistic (max absolute gap between the two empirical
+        CDFs) between an observed sample and a clean baseline sample.
+        Higher = more distributionally different = more anomalous."""
+        return float(ks_2samp(observed_gaps, baseline_gaps).statistic)
+
+    def calibrate(
+        self,
+        clean_gap_sampler: Callable[[], np.ndarray],
+        n_trials: int = 200,
+        percentile: float = 95.0,
+    ) -> float:
+        """Sets threshold_ from the tail of the CLEAN-vs-CLEAN null
+        distribution of the KS D statistic.
+
+        ``clean_gap_sampler`` is a zero-arg callable returning a fresh,
+        independent clean gap sample each call (e.g.
+        ``functools.partial(generate_inter_packet_gaps, slice_type,
+        n_packets, rng)`` with an rng not shared with whatever produces the
+        gaps later scored against this threshold). ``n_trials`` independent
+        PAIRS are drawn; each pair's KS statistic is one draw from the null
+        distribution this calibrates against.
+        """
+        if not 0.0 < percentile <= 100.0:
+            raise ValueError("percentile must be in (0, 100]")
+        null_stats = np.empty(n_trials)
+        for i in range(n_trials):
+            a = clean_gap_sampler()
+            b = clean_gap_sampler()
+            null_stats[i] = self.statistic(a, b)
+        self.threshold_ = float(np.percentile(null_stats, percentile))
+        return self.threshold_
+
+    def is_anomalous(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> bool:
+        if self.threshold_ is None:
+            raise RuntimeError("Call calibrate() before is_anomalous().")
+        return self.statistic(observed_gaps, baseline_gaps) > self.threshold_
+
+    def score(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> KSDetectionResult:
+        stat = self.statistic(observed_gaps, baseline_gaps)
+        if self.threshold_ is None:
+            raise RuntimeError("Call calibrate() before score().")
+        return KSDetectionResult(statistic=stat, anomaly=stat > self.threshold_)
+
+    def anomaly_by_slice(
+        self,
+        observed_gaps_by_slice: dict[str, np.ndarray],
+        baseline_gaps_by_slice: dict[str, np.ndarray],
+    ) -> dict[str, bool]:
+        """Per-slice anomaly flags, shaped as ``dict[str, bool]`` --
+        directly compatible with
+        ``pqc_auth.orchestration.drive_reauth_from_detector_flags``'s
+        ``anomaly_by_slice`` parameter (not wired in here, see module
+        docstring)."""
+        return {
+            slice_type: self.is_anomalous(observed_gaps_by_slice[slice_type], baseline_gaps_by_slice[slice_type])
+            for slice_type in observed_gaps_by_slice
+        }
