@@ -30,6 +30,7 @@ from integration.auth_over_topology import (
     build_plan,
     build_teardown_cmds,
     summarize_rtts,
+    summarize_served_log,
 )
 from network_covert_channel.topology import NetnsTopology
 from slicing_sim.ofdm_grid import SLICE_TYPES
@@ -202,6 +203,33 @@ class PlanTests(unittest.TestCase):
                           if s.meta["trust_mode"] == "tofu" and s.meta["slice_type"] == tofu_rogue.meta["slice_type"])
         self.assertEqual(_arg(tofu_rogue.argv, "--trust-store"), _arg(legit_tofu.argv, "--trust-store"))
 
+    def test_idle_attack_runs_from_rogue_and_every_slice_is_served_while_it_holds(self):
+        kinds_names = [(s.kind, s.name) for s in self.plan]
+        start = next(i for i, s in enumerate(self.plan) if s.kind == "start" and s.meta.get("proc") == "idle")
+        finish = next(i for i, s in enumerate(self.plan) if s.kind == "finish" and s.meta.get("proc") == "idle")
+        between = self.plan[start + 1:finish]
+        self.assertEqual({s.meta["slice_type"] for s in between}, set(SLICE_TYPES), kinds_names)
+        self.assertTrue(all(s.meta["group"] == "idle_attack" for s in between))
+        attacker = self.plan[start].argv
+        self.assertEqual(attacker[:4], ("ip", "netns", "exec", ROGUE.netns))
+        self.assertEqual(_arg(attacker, "--server"), CORE.ip(self.topo))
+        self.assertLess(self.cfg.idle_attack_connections, 32)  # below ReauthServer's default cap
+        self.assertGreater(self.cfg.idle_attack_hold_s, self.cfg.server_connection_timeout)
+        core = next(s for s in self.plan if s.kind == "start" and s.meta["proc"] == "core")
+        self.assertEqual(float(_arg(core.argv, "--connection-timeout")), self.cfg.server_connection_timeout)
+
+    def test_malformed_probe_is_followed_by_a_served_request_per_slice(self):
+        i = next(i for i, s in enumerate(self.plan) if s.kind == "probe")
+        self.assertEqual(self.plan[i].argv[:4], ("ip", "netns", "exec", ROGUE.netns))
+        self.assertEqual(self.plan[i].meta["alive_proc"], "core")
+        after = [s for s in self.plan[i + 1:] if s.meta.get("group") == "after_malformed"]
+        self.assertEqual({s.meta["slice_type"] for s in after}, set(SLICE_TYPES))
+
+    def test_server_stats_read_the_core_served_log_before_the_audit(self):
+        kinds = [s.kind for s in self.plan]
+        self.assertEqual(kinds[-2:], ["server_stats", "audit"])
+        self.assertEqual(self.plan[-2].meta["served_log"], str(self.cfg.served_log(CORE)))
+
     def test_link_fault_steps_cover_both_modes(self):
         modes = {s.meta["mode"] for s in self.plan if s.kind == "link_fault"}
         self.assertEqual(modes, {"blackhole", "link_down"})
@@ -304,6 +332,40 @@ class RunnerTests(unittest.TestCase):
         runner.execute([Step("link_fault", "lf", argv=("PY",), meta=meta)])
         self.assertIn(["RESTORE"], run.calls)
         self.assertEqual(runner.report["clients"][0]["events"][-1]["event"], "fault_removed_after_client_ended")
+
+    def test_probe_records_output_and_whether_the_server_survived(self):
+        core = FakePopen(["READY {}"])
+        run = FakeRun(stdout_for=lambda argv: '{"case": "x", "server_reply": "invalid_json"}\n' if "probe" in argv else "")
+        plan = [Step("start", "core", argv=("PY",), meta={"proc": "core"}),
+                Step("probe", "p", argv=("PY", "probe"), meta={"alive_proc": "core"})]
+        runner = self._runner(run, popen=lambda argv: core)
+        runner.execute(plan)
+        (probe,) = runner.report["probes"]
+        self.assertTrue(probe["server_alive_after"])
+        self.assertEqual(probe["records"], [{"case": "x", "server_reply": "invalid_json"}])
+
+    def test_finish_waits_for_the_process_and_keeps_its_json_output(self):
+        idle = FakePopen(["READY {}", '{"event": "idle_attacker_done", "closed_by_server": 8}'])
+        plan = [Step("start", "idle", argv=("PY",), meta={"proc": "idle"}),
+                Step("finish", "wait", meta={"proc": "idle", "timeout_s": 2})]
+        runner = self._runner(FakeRun(), popen=lambda argv: idle)
+        runner.execute(plan)
+        self.assertEqual(runner.report["probes"][0]["records"][0]["closed_by_server"], 8)
+        self.assertFalse(runner.report["probes"][0]["timed_out"])
+
+    def test_served_log_summary_measures_sign_and_verify_and_tallies_errors(self):
+        records = [
+            {"event": "served", "due": True, "sign_ms": 0.5, "verify_ms": 0.2},
+            {"event": "served", "due": True, "sign_ms": 1.5, "verify_ms": 0.1},
+            {"event": "served", "due": False, "sign_ms": None, "verify_ms": None},
+            {"event": "error", "code": "invalid_json"},
+            {"event": "rejected_at_capacity"},
+        ]
+        summary = summarize_served_log(records)
+        self.assertEqual(summary["sign_ms"]["n"], 2)
+        self.assertEqual(summary["sign_ms"]["median_ms"], 1.0)
+        self.assertEqual(summary["verify_ms"]["max_ms"], 0.2)
+        self.assertEqual(summary["events"], {"error:invalid_json": 1, "rejected_at_capacity": 1, "served": 3})
 
     def test_rtt_summary_only_counts_legit_successful_requests(self):
         report = {"clients": [
