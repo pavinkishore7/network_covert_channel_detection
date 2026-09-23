@@ -34,7 +34,7 @@ import numpy as np
 import pytest
 
 from network_covert_channel.capture import build_capture_cmd, parse_pcap_to_dataframe, pcap_filename, preferred_capture_tool
-from network_covert_channel.topology import NetnsTopology
+from network_covert_channel.topology import NetnsTopology, netns_privilege_skip_reason
 from network_covert_channel.traffic import build_traffic_plan, send_traffic_plan
 from slicing_sim.ofdm_grid import SLICE_TYPES
 
@@ -48,22 +48,9 @@ class LiveTopologyDemoTest(unittest.TestCase):
     run without them, rather than failing confusingly mid-setup."""
 
     def setUp(self):
-        try:
-            probe = subprocess.run(
-                ["ip", "netns", "add", "__ncc_priv_probe__"], capture_output=True, text=True
-            )
-        except OSError as exc:
-            # `ip` itself isn't on PATH at all -- a different, earlier
-            # failure than "found ip but lack CAP_NET_ADMIN" (below), and
-            # worth telling apart in the skip message: one means "install
-            # iproute2", the other means "run as root/with the capability".
-            self.skipTest(f"requires the 'ip' binary (iproute2), not found on PATH ({exc})")
-        if probe.returncode != 0:
-            self.skipTest(
-                "requires root/CAP_NET_ADMIN to create network namespaces "
-                f"(probe failed: {probe.stderr.strip()})"
-            )
-        subprocess.run(["ip", "netns", "delete", "__ncc_priv_probe__"], capture_output=True)
+        skip_reason = netns_privilege_skip_reason()
+        if skip_reason is not None:
+            self.skipTest(skip_reason)
 
         self.topo = NetnsTopology()
         self.addCleanup(self.topo.teardown)

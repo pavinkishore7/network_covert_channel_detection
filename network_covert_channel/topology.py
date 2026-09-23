@@ -134,6 +134,31 @@ def _default_run(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, check=False)
 
 
+PRIVILEGE_PROBE_NETNS = "__ncc_priv_probe__"
+
+
+def netns_privilege_skip_reason() -> str | None:
+    """The one privilege check for everything that needs real namespaces:
+    actually try ``ip netns add`` (then delete it) rather than inspecting
+    euid/capabilities, since what matters is whether THIS kernel lets THIS
+    process do it (root without the capability, or a user namespace with
+    it, both exist). Returns ``None`` if namespaces can be created, else a
+    human-readable reason suitable for ``skipTest()``.
+    """
+    try:
+        probe = subprocess.run(["ip", "netns", "add", PRIVILEGE_PROBE_NETNS], capture_output=True, text=True)
+    except OSError as exc:
+        # `ip` itself isn't on PATH at all -- a different, earlier failure
+        # than "found ip but lack CAP_NET_ADMIN" (below), and worth telling
+        # apart: one means "install iproute2", the other means "run as
+        # root/with the capability".
+        return f"requires the 'ip' binary (iproute2), not found on PATH ({exc})"
+    if probe.returncode != 0:
+        return f"requires root/CAP_NET_ADMIN to create network namespaces (probe failed: {probe.stderr.strip()})"
+    subprocess.run(["ip", "netns", "delete", PRIVILEGE_PROBE_NETNS], capture_output=True)
+    return None
+
+
 class NetnsTopology:
     """Builds/tears down the three-namespace, bridge-connected topology.
 
