@@ -52,6 +52,13 @@ Three independent checks per record:
        response was not an answer to the client's request. Again crypto
        validity is NOT asserted (a replayed genuine response verifies);
        instead the mismatch claim itself is recomputed from the record.
+     - Records written since the failure policy (``record_type``):
+       verification records must also have an ``outcome`` consistent with
+       their flags; ``transport_failure`` / ``unauthenticated_response``
+       records carry no signature, so no crypto check -- they must simply
+       not claim trust or signed material; ``policy_decision`` records must
+       be re-derivable from the earlier outcome records they cite. See
+       ``_check_record`` and the functions it dispatches to.
 """
 
 from __future__ import annotations
@@ -84,6 +91,36 @@ _HMAC_BACKED_BACKENDS = {"FakeSigner", "_DemoFakeSigner", "_DemoLoopSigner"}
 # everything else in this module. tests/test_transport_binding.py asserts
 # the two literals stay equal.
 _SIGNATURE_DOMAIN_V2 = b"pqc_auth.reauth.v2\x00"
+
+
+# pqc_auth/outcomes.py's RequestOutcome values and their categories,
+# repeated as literals for the same independence reason as the domain tag
+# above; tests/test_failure_policy.py asserts they stay equal.
+_OK_OUTCOMES = {"verified", "not_due"}
+_AUTH_FAILURE_OUTCOMES = {
+    "rejected_signature", "rejected_replay", "rejected_challenge_mismatch", "rejected_pinned_key",
+    "rejected_tofu_key_changed", "rejected_unsigned_status", "malformed_response",
+}
+_TRANSPORT_FAILURE_OUTCOMES = {"timeout", "connection_failed"}
+_REFUSED_OUTCOMES = {"server_refused"}
+
+# For a signature-bearing ("verification") record: what each outcome
+# requires of the record's own fields. trusted=True means the answer was
+# authenticated; each rejection outcome corresponds to exactly one flag
+# (or, for rejected_signature, to no flag at all -- it is the plain
+# "signature did not verify" case, and the crypto recheck in
+# _check_signature confirms it).
+_VERIFICATION_OUTCOME_RULES = {
+    "verified": {"trusted": True, "flag": None, "status": "due"},
+    "not_due": {"trusted": True, "flag": None, "status": "not_due"},
+    "server_refused": {"trusted": True, "flag": None, "status": "error"},
+    "rejected_signature": {"trusted": False, "flag": None},
+    "rejected_replay": {"trusted": False, "flag": "rejected_as_replay"},
+    "rejected_challenge_mismatch": {"trusted": False, "flag": "challenge_mismatch"},
+    "rejected_pinned_key": {"trusted": False, "flag": "pinned_key_mismatch"},
+    "rejected_tofu_key_changed": {"trusted": False, "flag": "trust_store_key_changed"},
+}
+_REJECTION_FLAGS = ("rejected_as_replay", "challenge_mismatch", "pinned_key_mismatch", "trust_store_key_changed")
 
 
 def _canonical_json(fields: dict) -> str:
@@ -122,6 +159,10 @@ def _check_signature(record: dict) -> tuple[bool, str]:
             return False, f"malformed signed_payload/expected_challenge: {exc}"
         if payload_nonce != nonce:
             return False, "record nonce does not match the signed payload's server_nonce"
+        if "status" in record and record.get("status") != payload.get("status", "due"):
+            return False, (
+                f"record status={record.get('status')!r} but the signed payload says {payload.get('status')!r}"
+            )
     else:
         if challenge_mismatch or "expected_challenge" in record:
             return False, "challenge fields present without signed_payload -- not a valid v1 or v2 record"
@@ -264,12 +305,178 @@ class LogVerificationResult:
         return all(r.ok for r in self.records)
 
 
+def _check_verification_outcome(record: dict) -> tuple[bool, str]:
+    """For a verification record that names its ``outcome``: the outcome
+    and the record's own fields must tell the same story.
+
+    Why this is needed on top of _check_signature: that check proves the
+    trusted/flag fields are consistent with the SIGNATURE; this one proves
+    the summary the failure policy acts on (``outcome``) is consistent with
+    those fields. Without it, a record could say outcome=verified while its
+    flags say the key was wrong, and a policy decision citing it as
+    "authenticated" would look justified. So: the outcome must be one that
+    a signature-bearing record can have; ``trusted`` must match it; exactly
+    the rejection flag that outcome implies must be set, and no other.
+    """
+    outcome = record["outcome"]
+    rule = _VERIFICATION_OUTCOME_RULES.get(outcome)
+    if rule is None:
+        return False, f"outcome={outcome!r} cannot appear on a signature-bearing verification record"
+    if bool(record.get("trusted")) != rule["trusted"]:
+        return False, f"outcome={outcome!r} but record claims trusted={record.get('trusted')!r}"
+    set_flags = [f for f in _REJECTION_FLAGS if record.get(f)]
+    expected = [rule["flag"]] if rule["flag"] else []
+    if set_flags != expected:
+        return False, f"outcome={outcome!r} but rejection flags set are {set_flags} (expected {expected})"
+    if "status" in rule and record.get("status") != rule["status"]:
+        return False, f"outcome={outcome!r} but record status={record.get('status')!r}"
+    return True, ""
+
+
+def _check_signatureless_record(record: dict, allowed: set[str], kind: str) -> tuple[bool, str]:
+    """``transport_failure`` and ``unauthenticated_response`` records.
+
+    Reasoning -- same discipline as the wrong-key branch in
+    _check_signature: a TIMEOUT or CONNECTION_FAILED record has no response
+    and therefore no signature; an unsigned "not due" or a malformed line
+    has nothing that was signed. Asking "does the signature verify" is the
+    wrong question for all of them -- there is no signature to ask it of,
+    and demanding one would FAIL every correctly recorded outage.
+
+    What CAN be checked: the outcome is one this record type may carry; the
+    record never claims the response was trusted; and it carries no
+    signature material or rejection flag, which could only have come from a
+    signed response (a record mixing the two was not written by the
+    client's logic).
+    """
+    outcome = record.get("outcome")
+    if outcome not in allowed:
+        return False, f"{kind} record with outcome={outcome!r} (allowed: {sorted(allowed)})"
+    if record.get("trusted"):
+        return False, f"{kind} record claims trusted=True"
+    for key in ("signature", "public_key", "signed_payload", *_REJECTION_FLAGS):
+        if record.get(key):
+            return False, f"{kind} record carries {key!r}, which only a signed response could produce"
+    attempt = record.get("attempt")
+    if not isinstance(attempt, int) or attempt < 1:
+        return False, f"{kind} record has invalid attempt={attempt!r}"
+    return True, ""
+
+
+def _category_of(outcome: str | None) -> str | None:
+    if outcome in _OK_OUTCOMES:
+        return "ok"
+    if outcome in _AUTH_FAILURE_OUTCOMES:
+        return "auth_failure"
+    if outcome in _TRANSPORT_FAILURE_OUTCOMES:
+        return "transport_failure"
+    if outcome in _REFUSED_OUTCOMES:
+        return "refused"
+    return None
+
+
+def _check_policy_decision(record: dict, prior: dict[int, dict]) -> tuple[bool, str]:
+    """A failure-policy decision must be justified by the outcome records it
+    cites (``trigger_seqs``), all of which must appear EARLIER in this same
+    log, for the same slice.
+
+    Reasoning: a decision record has no signature of its own; what makes it
+    trustworthy is that anyone can re-derive it from the evidence before it.
+    A QUARANTINE_FLAG in particular takes a slice out of trusted service, so
+    the auditor recomputes the rule that produced it from the cited records
+    instead of taking the record's word for it:
+      - quarantine for auth failures: >= threshold cited records, every one
+        an AUTH_FAILURE outcome, all within window_s of the decision;
+      - quarantine for transport failures: only legal when the slice was
+        fail_closed (otherwise dropping packets could quarantine a slice --
+        the DoS-amplification case the policy exists to prevent), and the
+        cited records must be >= threshold TRANSPORT_FAILUREs with no
+        authenticated outcome for that slice between the first cited record
+        and the decision (i.e. really consecutive);
+      - escalation: cited record is an AUTH_FAILURE (transport failures
+        never escalate);
+      - quarantine_cleared: cited record is an authenticated (OK) outcome.
+    Crypto validity is not re-asked here: the cited records' own checks
+    already did that, record by record.
+    """
+    slice_type = record.get("slice_type")
+    action, rule = record.get("action"), record.get("rule")
+    seqs = record.get("trigger_seqs") or []
+    own_seq = record.get("seq")
+    cited = []
+    for seq in seqs:
+        cited_record = prior.get(seq)
+        if cited_record is None or not isinstance(own_seq, int) or seq >= own_seq:
+            return False, f"policy decision cites seq {seq}, which is not an earlier record in this log"
+        if cited_record.get("slice_type") != slice_type:
+            return False, f"policy decision for {slice_type!r} cites seq {seq} for {cited_record.get('slice_type')!r}"
+        cited.append(cited_record)
+    categories = [_category_of(r.get("outcome")) for r in cited]
+    threshold = record.get("threshold") or 0
+
+    if action == "quarantine_flag":
+        if rule == "auth_failures_to_quarantine":
+            window = float(record.get("window_s") or 0)
+            if len(cited) < threshold or any(c != "auth_failure" for c in categories):
+                return False, f"quarantine cites {categories}, not >= {threshold} auth failures"
+            if any(float(record["now"]) - float(r.get("now", float("-inf"))) > window for r in cited):
+                return False, "quarantine cites an auth failure outside its window"
+            return True, ""
+        if rule == "transport_failures_to_quarantine_fail_closed":
+            if not record.get("fail_closed"):
+                return False, "quarantine for transport failures on a slice that is not fail_closed"
+            if len(cited) < threshold or any(c != "transport_failure" for c in categories):
+                return False, f"quarantine cites {categories}, not >= {threshold} transport failures"
+            first = min(seqs)
+            between = [r for s, r in prior.items() if first < s < own_seq and r.get("slice_type") == slice_type]
+            if any(_category_of(r.get("outcome")) == "ok" for r in between):
+                return False, "quarantine's transport failures are not consecutive (an authenticated answer intervenes)"
+            return True, ""
+        return False, f"quarantine_flag with unknown rule {rule!r}"
+    if action == "escalate_to_detector_alert" or record.get("escalated"):
+        if not cited or categories[-1] != "auth_failure":
+            return False, f"escalation must be triggered by an auth failure, cites {categories}"
+    if action == "none":
+        if rule != "quarantine_cleared" or not cited or categories[-1] != "ok":
+            return False, f"'none' decision logged without an authenticated outcome clearing quarantine ({rule!r})"
+        return True, ""
+    if action == "alert":
+        if rule == "transport_failures_to_alert" and (len(cited) < threshold or any(c != "transport_failure" for c in categories)):
+            return False, f"transport alert cites {categories}, not >= {threshold} transport failures"
+        if rule == "refused" and categories != ["refused"]:
+            return False, f"refusal alert cites {categories}"
+        if rule == "auth_failure" and (not cited or categories[-1] != "auth_failure"):
+            return False, f"auth-failure alert cites {categories}"
+        return True, ""
+    if action == "escalate_to_detector_alert":
+        return True, ""
+    return False, f"unknown policy action {action!r}"
+
+
+def _check_record(record: dict, prior: dict[int, dict]) -> tuple[bool, str]:
+    record_type = record.get("record_type", "verification")  # records predating record_type are all verifications
+    if record_type == "transport_failure":
+        return _check_signatureless_record(record, _TRANSPORT_FAILURE_OUTCOMES, "transport_failure")
+    if record_type == "unauthenticated_response":
+        return _check_signatureless_record(record, {"rejected_unsigned_status", "malformed_response"},
+                                           "unauthenticated_response")
+    if record_type == "policy_decision":
+        return _check_policy_decision(record, prior)
+    if record_type != "verification":
+        return False, f"unknown record_type {record_type!r}"
+    ok, reason = _check_signature(record)
+    if ok and "outcome" in record:
+        ok, reason = _check_verification_outcome(record)
+    return ok, reason
+
+
 def verify_log(path: str | Path) -> LogVerificationResult:
     path = Path(path)
     raw_lines = [line.rstrip(b"\n") for line in path.read_bytes().split(b"\n") if line.strip()]
 
     results: list[RecordResult] = []
     expected_prev_hash = GENESIS_HASH
+    prior: dict[int, dict] = {}  # earlier records by seq, for policy decisions to cite
 
     for index, raw_line in enumerate(raw_lines):
         try:
@@ -295,11 +502,13 @@ def verify_log(path: str | Path) -> LogVerificationResult:
                 f"(expected {expected_prev_hash}, found {record.get('prev_hash')})"
             )
 
-        sig_ok, sig_reason = _check_signature(record)
-        if not sig_ok:
-            reasons.append(sig_reason)
+        record_ok, record_reason = _check_record(record, prior)
+        if not record_ok:
+            reasons.append(record_reason)
 
         results.append(RecordResult(index=index, seq=record.get("seq"), reasons=reasons))
+        if isinstance(record.get("seq"), int):
+            prior[record["seq"]] = record
         expected_prev_hash = hashlib.sha256(raw_line).hexdigest()
 
     return LogVerificationResult(path=path, records=results)

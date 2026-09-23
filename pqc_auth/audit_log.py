@@ -78,6 +78,11 @@ class AuditLogger:
         challenge_mismatch: bool = False,
         signed_payload: str | None = None,
         expected_challenge: bytes | None = None,
+        outcome: str | None = None,
+        status: str | None = None,
+        now: float | None = None,
+        attempt: int | None = None,
+        request_id: str | None = None,
     ) -> dict:
         """Append one record and return it as the dict that was written.
 
@@ -96,6 +101,14 @@ class AuditLogger:
         signed bytes and independently re-check the challenge comparison.
         When omitted, none of the three is written and the record keeps the
         pre-v2 shape, in which the signature covers ``nonce`` alone.
+
+        ``outcome`` (a pqc_auth.outcomes.RequestOutcome value), ``status``
+        (the response's signed status: due / not_due / error), ``now`` (the
+        request's logical time), ``attempt`` and ``request_id`` are written
+        when given, together with ``record_type: "verification"``, so every
+        attempt's result is explicit in the log and the failure policy's
+        decision records can point at it. Omitted, the record keeps its
+        earlier shape.
         """
         fields = {
             "seq": self._next_seq,
@@ -120,6 +133,28 @@ class AuditLogger:
             fields["challenge_mismatch"] = bool(challenge_mismatch)
         elif challenge_mismatch:
             raise ValueError("challenge_mismatch requires signed_payload and expected_challenge")
+        if outcome is not None:
+            fields.update(
+                record_type="verification", outcome=outcome, status=status, now=now,
+                attempt=attempt, request_id=request_id,
+            )
+        return self._append(fields)
+
+    def log_event(self, record_type: str, **fields) -> dict:
+        """Append a record that carries no signed material: a transport
+        failure (``record_type="transport_failure"``), a response that could
+        not even be parsed as a signed payload
+        (``"unauthenticated_response"``), or a failure-policy decision
+        (``"policy_decision"``). pqc_auth/audit_verify.py checks each type
+        by its own rules -- see the reasoning there."""
+        if record_type not in ("transport_failure", "unauthenticated_response", "policy_decision"):
+            raise ValueError(f"unknown record_type {record_type!r}")
+        return self._append({
+            "seq": self._next_seq, "timestamp": time.time(), "record_type": record_type,
+            **fields, "prev_hash": self._prev_line_hash,
+        })
+
+    def _append(self, fields: dict) -> dict:
         record_hash = hashlib.sha256(canonical_json(fields).encode("utf-8")).hexdigest()
         record = {**fields, "record_hash": record_hash}
         line = canonical_json(record).encode("utf-8")
