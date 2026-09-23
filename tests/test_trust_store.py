@@ -171,13 +171,13 @@ class ReauthClientTofuTests(unittest.TestCase):
         tampered first-contact response must be rejected like any other
         signature failure and must leave the trust store empty."""
         client = self._client_against(self.server)
-        captured = client._send_request("URLLC", 0, detector_alert=False)
+        captured, challenge = client._send_request("URLLC", 0, detector_alert=False)
         tampered = dict(captured)
         tampered_sig = bytearray(bytes.fromhex(tampered["signature"]))
         tampered_sig[0] ^= 0xFF
         tampered["signature"] = tampered_sig.hex()
 
-        result = client.process_response(tampered, now=0)
+        result = client.process_response(tampered, now=0, expected_challenge=challenge)
 
         self.assertTrue(result.due)
         self.assertFalse(result.trusted)
@@ -194,12 +194,12 @@ class ReauthClientTofuTests(unittest.TestCase):
         doesn't leave the trust store in a state that locks out the real
         server's later, genuine first response."""
         forging_client = self._client_against(self.server)
-        captured = forging_client._send_request("URLLC", 0, detector_alert=False)
+        captured, challenge = forging_client._send_request("URLLC", 0, detector_alert=False)
         tampered = dict(captured)
         tampered_sig = bytearray(bytes.fromhex(tampered["signature"]))
         tampered_sig[0] ^= 0xFF
         tampered["signature"] = tampered_sig.hex()
-        forging_client.process_response(tampered, now=0)  # rejected, not persisted
+        forging_client.process_response(tampered, now=0, expected_challenge=challenge)  # rejected, not persisted
 
         # A later, genuine response for the same server_id (now=30, past
         # the periodic interval the forged request already consumed on

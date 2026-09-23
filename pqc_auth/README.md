@@ -41,11 +41,14 @@ per-slice `reauth()` calls. This is the only place detector output and
 re-auth decisions are connected; nothing here reimplements `due()`'s
 scheduling logic.
 
-**`transport.py`** — a real two-party channel over a local TCP socket.
-`ReauthServer` holds a signing-capable `Signer` and a controller; on a
-request it calls `reauth()` and sends back `(reason, nonce, signature,
-public_key)` — **not** `ReauthOutcome.verified`, which never crosses the
-wire at all. `ReauthClient` holds only a public key and a bare
+**`transport.py`** — a real two-party channel over TCP (wire version 2).
+The client sends a fresh random 32-byte challenge with every request.
+`ReauthServer` holds a signing-capable `Signer` and a controller. On a
+request it calls `reauth()`, which signs a canonical payload binding
+`client_challenge`, `server_id`, `slice_type`, `reason`, the server's
+own nonce and timestamps. The server sends back that payload, the
+signature and the public key. It does **not** send
+`ReauthOutcome.verified`, which never crosses the wire at all. `ReauthClient` holds only a public key and a bare
 `PublicKeyVerifier`-shaped `verify_fn`, injected by whoever constructs it —
 `transport.py` never imports a concrete signer backend itself, which is
 what keeps it signer-agnostic. The client independently verifies every
@@ -53,12 +56,31 @@ response; it never trusts anything the server claims about its own
 verification. It can optionally be pinned to one specific
 `expected_public_key` — see "Public-key pinning" below.
 
-Replay protection lives entirely on the client: `ReauthClient` remembers
-accepted nonces for `DEFAULT_REPLAY_WINDOW_SECONDS` (300s, chosen to exceed
-`mMTC`'s 300s periodic interval — the longest configured — so a legitimate
-nonce is never pruned mid-cycle, while still bounding memory for a
-long-running client) and rejects a repeated nonce even when its signature
-is still cryptographically valid.
+**Replay protection is challenge-response.** A response is only acceptable
+if its signed payload carries the exact challenge this client sent, and
+the comparison is constant-time. A mismatch is its own outcome,
+`challenge_mismatch`, and it is checked before `verify_fn`, because a
+replayed response carries a perfectly valid signature. The check needs no
+memory, so it holds across client restarts.
+
+Before wire version 2 the request had no client randomness, and the only
+defence was an in-memory seen-nonce set. A restarted client accepted a
+recorded response; `integration/README.md` shows that on the real
+topology. The seen-nonce set (`DEFAULT_REPLAY_WINDOW_SECONDS`, 300 s) is
+kept as defence in depth only. Version-1 messages are refused in both
+directions; there is no compatibility path.
+
+The audit log records the signed payload and the expected challenge, so
+`audit_verify` recomputes both the signature and the challenge comparison.
+For `challenge_mismatch` records it deliberately does not assert
+"crypto valid ⇒ trusted"; see its docstring.
+
+`ReauthServer` handles connections concurrently: one thread each, capped,
+with a per-connection read timeout. It size-caps and fully validates
+every request, so malformed input gets an error reply or a closed
+connection instead of killing the server. The controller's scheduling
+decision is made under a lock, so concurrent requests for one slice fire
+at most once.
 
 **Public-key pinning.** `ReauthClient(..., expected_public_key=...)` pins
 the client to one specific identity. In `process_response()`, if the
@@ -285,17 +307,19 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   real namespace topology**, with server and clients as separate processes
   in separate namespaces, via `python -m pqc_auth.transport serve|request`
   (see `main()` in `transport.py`) and `integration/auth_over_topology.py`.
-  See `integration/README.md` for what that run showed: replay/rogue
-  outcomes, what a client does when the link dies, the per-process
-  replay-window gap, and latency caveats.
-- **No production-grade connection handling.** No retries on a dropped
-  connection, no reconnection logic, no timeout tuning beyond a flat
-  per-call socket timeout, and no transport-layer security beyond the
-  signature itself — there is no TLS-equivalent confidentiality or
-  anti-tampering on the request side (which only carries `slice_type`,
-  `now`, and a boolean, none of them secret), and a network-level attacker
-  can still see and drop traffic even though they can't forge or replay a
-  valid response.
+  See `integration/README.md` for what those runs showed: replay/rogue
+  outcomes before and after the challenge binding, idle and malformed
+  attacker connections, what a client does when the link dies, measured
+  sign/verify time, and latency caveats.
+- **Connection handling is still minimal on the client.** The client has no
+  retries or reconnection logic, and only a flat per-call socket timeout.
+- **No transport-layer security beyond the signature itself.** Requests are
+  not authenticated, and a `{"due": false}` answer is not signed. A
+  network-level attacker can still see traffic, drop it, or make a re-auth
+  look "not due". It cannot forge a response or replay one.
+- **Connection cap exhaustion.** The server's connection cap bounds what one
+  attacker can hold. An attacker that fills every slot still locks everyone
+  out until those connections time out, because there is no per-peer limit.
 - **No real-time integration with a running detector process** (this was
   already true of `orchestration.py` before this round of work, and still
   is): `drive_reauth_from_detector_flags()` takes anomaly flags you've

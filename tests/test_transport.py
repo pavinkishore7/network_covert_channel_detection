@@ -11,7 +11,9 @@ from __future__ import annotations
 import unittest
 
 from pqc_auth.reauth import DualTriggerReauthController
-from pqc_auth.transport import ReauthClient, ReauthServer
+import json
+
+from pqc_auth.transport import ReauthClient, ReauthServer, signed_message
 
 from tests.fake_signer import FakeSigner
 
@@ -51,28 +53,39 @@ class FakeSignerTransportTests(unittest.TestCase):
 
     def test_replayed_response_is_rejected_even_though_signature_is_valid(self):
         # A real round trip first, to prove the transport itself works and
-        # to capture a genuinely valid (nonce, signature, public_key) tuple.
-        captured = self.client._send_request("URLLC", 0, detector_alert=False)
-        first = self.client.process_response(captured, now=0)
+        # to capture a genuinely valid signed response.
+        captured, challenge = self.client._send_request("URLLC", 0, detector_alert=False)
+        first = self.client.process_response(captured, now=0, expected_challenge=challenge)
         self.assertTrue(first.due)
         self.assertTrue(first.trusted)
         self.assertFalse(first.rejected_as_replay)
 
-        # An attacker resends the exact same captured response later. The
-        # signature is still cryptographically valid -- verify_fn alone
-        # would accept it -- but replay tracking must reject it anyway.
-        replayed = self.client.process_response(captured, now=1)
+        # An attacker answers the client's NEXT request (which carries a new
+        # challenge) with the captured response. The signature is still
+        # cryptographically valid -- verify_fn alone would accept it -- but
+        # it is bound to the old challenge.
+        replayed = self.client.process_response(captured, now=1, expected_challenge=b"\x01" * 32)
         self.assertTrue(replayed.due)
         self.assertFalse(replayed.trusted)
-        self.assertTrue(replayed.rejected_as_replay)
+        self.assertTrue(replayed.challenge_mismatch)
+        self.assertFalse(replayed.rejected_as_replay)
+
+    def test_seen_nonce_set_still_rejects_a_repeat_as_defence_in_depth(self):
+        # Only reachable if the same challenge were reused, which
+        # request_reauth() never does; checks the secondary layer alone.
+        captured, challenge = self.client._send_request("URLLC", 0, detector_alert=False)
+        self.assertTrue(self.client.process_response(captured, now=0, expected_challenge=challenge).trusted)
+        again = self.client.process_response(captured, now=1, expected_challenge=challenge)
+        self.assertFalse(again.trusted)
+        self.assertTrue(again.rejected_as_replay)
 
     def test_tampered_signature_in_response_is_not_trusted(self):
-        captured = self.client._send_request("URLLC", 0, detector_alert=False)
+        captured, challenge = self.client._send_request("URLLC", 0, detector_alert=False)
         tampered = dict(captured)
         tampered_sig = bytearray(bytes.fromhex(tampered["signature"]))
         tampered_sig[0] ^= 0xFF
         tampered["signature"] = tampered_sig.hex()
-        result = self.client.process_response(tampered, now=0)
+        result = self.client.process_response(tampered, now=0, expected_challenge=challenge)
         self.assertTrue(result.due)
         self.assertFalse(result.trusted)
         self.assertFalse(result.rejected_as_replay)  # rejected on the crypto check, not as a replay
@@ -84,16 +97,17 @@ class FakeSignerTransportTests(unittest.TestCase):
             self.server.host, self.server.port, verify_fn=FakeSigner.verify_with_public_key,
             replay_window_seconds=10,
         )
-        captured = short_window_client._send_request("URLLC", 0, detector_alert=False)
-        first = short_window_client.process_response(captured, now=0)
+        captured, challenge = short_window_client._send_request("URLLC", 0, detector_alert=False)
+        first = short_window_client.process_response(captured, now=0, expected_challenge=challenge)
         self.assertTrue(first.trusted)
         # Well past the 10s window -- the nonce should have been pruned,
-        # so this is treated as a fresh (still cryptographically valid)
-        # message rather than a replay. This is a deliberate memory-bound
+        # so the seen-nonce layer alone no longer flags it (same challenge
+        # passed on purpose, to isolate that layer; a real replay would
+        # carry a stale challenge and fail challenge_mismatch first). This is a deliberate memory-bound
         # trade-off (see DEFAULT_REPLAY_WINDOW_SECONDS's docstring), not a
         # security gap for THIS test's timeline, which never resends a
         # message within the window.
-        replay_after_expiry = short_window_client.process_response(captured, now=100)
+        replay_after_expiry = short_window_client.process_response(captured, now=100, expected_challenge=challenge)
         self.assertTrue(replay_after_expiry.trusted)
         self.assertFalse(replay_after_expiry.rejected_as_replay)
 
@@ -121,8 +135,8 @@ class PublicKeyPinningTests(unittest.TestCase):
         self.server.stop()
 
     def test_pinning_rejects_a_genuinely_valid_signature_from_a_different_keypair(self):
-        captured = self.client._send_request("URLLC", 0, detector_alert=False)
-        nonce = bytes.fromhex(captured["nonce"])
+        captured, challenge = self.client._send_request("URLLC", 0, detector_alert=False)
+        message = signed_message(captured["payload"])
         signature = bytes.fromhex(captured["signature"])
         public_key = bytes.fromhex(captured["public_key"])
 
@@ -132,19 +146,19 @@ class PublicKeyPinningTests(unittest.TestCase):
         # And it is a perfectly genuine signature -- verify_fn alone, with
         # no pinning, would accept it. Proves the rejection below isn't
         # just piggybacking on a signature that would have failed anyway.
-        self.assertTrue(FakeSigner.verify_with_public_key(nonce, signature, public_key))
+        self.assertTrue(FakeSigner.verify_with_public_key(message, signature, public_key))
 
-        result = self.client.process_response(captured, now=0)
+        result = self.client.process_response(captured, now=0, expected_challenge=challenge)
         self.assertTrue(result.due)
         self.assertFalse(result.trusted)
         self.assertFalse(result.rejected_as_replay)
         self.assertTrue(result.pinned_key_mismatch)
 
     def test_pinning_rejection_does_not_consume_the_nonce(self):
-        captured = self.client._send_request("URLLC", 0, detector_alert=False)
-        result = self.client.process_response(captured, now=0)
+        captured, challenge = self.client._send_request("URLLC", 0, detector_alert=False)
+        result = self.client.process_response(captured, now=0, expected_challenge=challenge)
         self.assertTrue(result.pinned_key_mismatch)
-        self.assertNotIn(bytes.fromhex(captured["nonce"]), self.client._seen_nonces)
+        self.assertNotIn(bytes.fromhex(json.loads(captured["payload"])["server_nonce"]), self.client._seen_nonces)
 
     def test_response_from_the_correctly_pinned_key_is_still_trusted(self):
         # Same client, but pointed at a server backed by the PINNED signer

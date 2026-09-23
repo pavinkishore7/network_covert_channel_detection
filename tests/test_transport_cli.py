@@ -121,6 +121,18 @@ class LoopbackProcessTests(unittest.TestCase):
         self.assertTrue(record["result"]["trusted"])
         self.assertEqual(json.loads(store.read_text())["core"], (self.dir / "keys" / "public_key.bin").read_bytes().hex())
 
+    def test_malformed_request_does_not_stop_the_cli_server(self):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(b"garbage\n")
+            reply = json.loads(s.makefile().readline())
+        self.assertEqual(reply["error"], "invalid_json")
+        self.assertIsNone(self.server.poll())
+        # URLLC at a later `now` than any other test in this class uses for
+        # it: the server's schedule is shared across these tests.
+        code, (record,) = self._request("--slice-type", "URLLC", "--expected-pubkey-file", str(self.dir / "keys" / "public_key.bin"),
+                                        "--now", "30000")
+        self.assertTrue(record["result"]["trusted"])
+
     def test_connection_refused_is_reported_per_request_with_nonzero_exit(self):
         code, (record,) = self._request("--slice-type", "URLLC", "--expected-pubkey-file", str(self.dir / "keys" / "public_key.bin"),
                                         "--then", f"127.0.0.1:{_free_port()}", "--now", "20000", "--count", "0")
