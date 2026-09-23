@@ -64,6 +64,18 @@ root, WSL2's netns/veth support is not guaranteed to match a native Linux
 kernel's — that was not tested either way here. A native Linux host (or a
 VM) is the safer bet for the live run below.
 
+The privilege probe itself (try `ip netns add`, then delete it) now lives in
+`network_covert_channel.topology.netns_privilege_skip_reason()`, shared by
+every live test instead of copied into each one.
+
+**Update (2026-09-23):** on this same WSL2 machine, unprivileged user
+namespaces turned out to be enabled.
+`unshare --user --map-root-user --mount --net`, plus a tmpfs on `/run`,
+gives real `CAP_NET_ADMIN` over real kernel namespaces, veths, bridges and
+tc qdiscs, scoped to that user namespace. `integration/auth_over_topology.py`
+was run for real this way; see `integration/README.md`. The Phase 1 timing
+test above was **not** re-run as part of that work.
+
 ## Running the live demo
 
 On a real Linux machine where you have root or `CAP_NET_ADMIN`:
