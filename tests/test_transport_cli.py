@@ -137,7 +137,9 @@ class LoopbackProcessTests(unittest.TestCase):
         code, (record,) = self._request("--slice-type", "URLLC", "--expected-pubkey-file", str(self.dir / "keys" / "public_key.bin"),
                                         "--then", f"127.0.0.1:{_free_port()}", "--now", "20000", "--count", "0")
         self.assertEqual(code, 1)
-        self.assertEqual(record["error"]["type"], "ConnectionRefusedError")
+        self.assertEqual(record["outcome"], "connection_failed")
+        self.assertIn("ConnectionRefusedError", record["attempts"][0]["detail"])
+        self.assertEqual(len(record["attempts"]), 3)  # transport failures are retried
 
 
 if __name__ == "__main__":

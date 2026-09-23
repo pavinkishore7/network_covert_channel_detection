@@ -42,7 +42,9 @@ class FakeSignerTransportTests(unittest.TestCase):
         self.client.request_reauth("URLLC", 0)  # first periodic reauth
         result = self.client.request_reauth("URLLC", 5)  # well inside the 30s interval
         self.assertFalse(result.due)
-        self.assertIsNone(result.trusted)
+        # "not due" is now a signed answer too, so it is authenticated
+        self.assertTrue(result.trusted)
+        self.assertEqual(result.outcome.value, "not_due")
 
     def test_detector_alert_round_trip_over_real_socket(self):
         self.client.request_reauth("URLLC", 0)

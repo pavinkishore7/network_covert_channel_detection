@@ -20,11 +20,11 @@ from pqc_auth.reauth import DualTriggerReauthController
 from pqc_auth.transport import (
     SIGNATURE_DOMAIN,
     ReauthClient,
-    ReauthRequestError,
     ReauthServer,
     canonical_payload,
     signed_message,
 )
+from pqc_auth.outcomes import RequestOutcome
 from pqc_auth.trust_store import TrustStore
 
 from tests.fake_signer import FakeSigner
@@ -58,6 +58,15 @@ class ReplayResponder:
         self._running = False
         self._thread.join(timeout=2)
         self._sock.close()
+
+
+def _error_code(reply: bytes) -> str:
+    """A refusal is signed (code inside the payload) when the request carried
+    a usable challenge, and a bare unsigned error otherwise."""
+    response = json.loads(reply)
+    if "payload" in response:
+        return json.loads(response["payload"])["error_code"]
+    return response["error"]
 
 
 def _raw_exchange(port: int, payload: bytes, *, shutdown_write: bool = False, timeout: float = 3.0) -> bytes:
@@ -293,7 +302,7 @@ class MalformedInputTests(_ServerCase):
         for label, payload, code in self.CASES:
             with self.subTest(label):
                 reply = _raw_exchange(self.server.port, payload)
-                self.assertEqual(json.loads(reply)["error"], code, reply[:200])
+                self.assertEqual(_error_code(reply), code, reply[:200])
                 self.assertTrue(self.server._thread.is_alive())
                 self.assertEqual(self.server.stats[f"error:{code}"] >= 1, True)
         self.assertServesValidRequest()
@@ -305,10 +314,12 @@ class MalformedInputTests(_ServerCase):
         self.assertEqual(self.server.stats["error:truncated_request"], 1)
         self.assertServesValidRequest()
 
-    def test_client_surfaces_a_server_refusal_as_an_exception(self):
-        with self.assertRaises(ReauthRequestError) as ctx:
-            self.client().request_reauth("not-a-slice", 0)
-        self.assertEqual(ctx.exception.code, "unknown_slice_type")
+    def test_client_reports_an_authenticated_server_refusal(self):
+        result = self.client().request_reauth("not-a-slice", 0)
+        self.assertEqual(result.outcome, RequestOutcome.SERVER_REFUSED)
+        self.assertEqual(result.error_code, "unknown_slice_type")
+        self.assertTrue(result.trusted)  # the refusal itself was signed and bound to our challenge
+        self.assertEqual(len(result.attempts), 1)  # a refusal is never retried
 
     def test_served_log_records_errors_and_measured_sign_verify_time(self):
         _raw_exchange(self.server.port, b"{bad\n")
