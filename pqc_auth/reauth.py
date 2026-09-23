@@ -24,9 +24,11 @@ lockstep to ask the question safely.
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -92,7 +94,7 @@ class ReauthOutcome:
 
     ``verified`` is ``None`` when no signer was configured (nothing to
     verify); otherwise it is the actual boolean result of a sign+verify
-    round trip on ``nonce`` — never assumed true, always the real
+    round trip on ``signed_message`` — never assumed true, always the real
     ``signer.verify()`` return value.
     """
 
@@ -100,6 +102,14 @@ class ReauthOutcome:
     verified: bool | None
     nonce: bytes | None = None
     signature: bytes | None = None
+    # The exact bytes that were signed. Equal to ``nonce`` unless reauth()
+    # was given a ``sign_message`` builder (see there).
+    signed_message: bytes | None = None
+    # Wall-clock cost of signer.sign() / signer.verify() for this call,
+    # measured with time.perf_counter() around each one. None when nothing
+    # was signed.
+    sign_ms: float | None = None
+    verify_ms: float | None = None
 
 
 class DualTriggerReauthController:
@@ -110,6 +120,16 @@ class DualTriggerReauthController:
         self.signer = signer
         self._last_reauth: dict[str, float] = {}
         self._last_alert: dict[str, float] = {}
+        # due() is a read-modify-write of _last_reauth/_last_alert. A
+        # threaded caller (ReauthServer handles connections concurrently)
+        # could otherwise let two simultaneous requests for the same slice
+        # both read "not fired yet" and both fire. The lock lives HERE,
+        # not in the server, so every caller sharing this controller
+        # (e.g. live_loop's dry-run checks next to the server's real
+        # fires) gets the same guarantee. Only the scheduling decision is
+        # serialized; signing in reauth() happens after the lock is
+        # released, since the decision it acts on is already committed.
+        self._lock = threading.Lock()
 
     def due(self, slice_type: str, now: float, detector_alert: bool = False, dry_run: bool = False) -> ReauthReason | None:
         """Decide whether ``slice_type`` is due for re-auth right now.
@@ -133,6 +153,10 @@ class DualTriggerReauthController:
         """
         if slice_type not in self.policies:
             raise ValueError(f"Unknown slice type: {slice_type}")
+        with self._lock:
+            return self._due_locked(slice_type, now, detector_alert, dry_run)
+
+    def _due_locked(self, slice_type: str, now: float, detector_alert: bool, dry_run: bool) -> ReauthReason | None:
         policy = self.policies[slice_type]
         last = self._last_reauth.get(slice_type)
         alert_due = detector_alert and now - self._last_alert.get(slice_type, float("-inf")) >= policy.alert_cooldown_seconds
@@ -152,7 +176,14 @@ class DualTriggerReauthController:
         """Fresh, unpredictable per-call challenge: timestamp + slice_type + random token."""
         return f"{now}:{slice_type}:".encode() + secrets.token_bytes(16)
 
-    def reauth(self, slice_type: str, now: float, detector_alert: bool = False, dry_run: bool = False) -> ReauthOutcome | None:
+    def reauth(
+        self,
+        slice_type: str,
+        now: float,
+        detector_alert: bool = False,
+        dry_run: bool = False,
+        sign_message: Callable[[ReauthReason, bytes], bytes] | None = None,
+    ) -> ReauthOutcome | None:
         """Like :meth:`due`, but when a signer is configured and re-auth is
         due, also performs a real sign+verify round trip on a fresh
         challenge and reports whether it actually verified.
@@ -179,6 +210,17 @@ class DualTriggerReauthController:
         if dry_run or self.signer is None:
             return ReauthOutcome(reason=reason, verified=None)
         nonce = self._challenge(slice_type, now)
-        signature = self.signer.sign(nonce)
-        verified = self.signer.verify(nonce, signature)
-        return ReauthOutcome(reason=reason, verified=verified, nonce=nonce, signature=signature)
+        # sign_message, if given, maps (reason, this call's fresh nonce) to
+        # the bytes that actually get signed -- how pqc_auth.transport binds
+        # the signature to the client's challenge and the other response
+        # fields. Without it, the bare nonce is signed, as before.
+        message = sign_message(reason, nonce) if sign_message is not None else nonce
+        started = time.perf_counter()
+        signature = self.signer.sign(message)
+        signed = time.perf_counter()
+        verified = self.signer.verify(message, signature)
+        finished = time.perf_counter()
+        return ReauthOutcome(
+            reason=reason, verified=verified, nonce=nonce, signature=signature, signed_message=message,
+            sign_ms=(signed - started) * 1000.0, verify_ms=(finished - signed) * 1000.0,
+        )

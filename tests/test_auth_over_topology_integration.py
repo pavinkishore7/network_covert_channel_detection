@@ -13,7 +13,10 @@ Skips itself, with the reason, when namespaces can't be created -- the same
 probe tests/test_network_live_integration.py uses
 (network_covert_channel.topology.netns_privilege_skip_reason).
 
-What is asserted is what the current code is supposed to guarantee. The
+What is asserted is what the current code is supposed to guarantee:
+challenge-bound replays rejected (including by a fresh client process),
+slices served while idle attacker connections are held, the server
+surviving malformed requests. The
 link-failure runs are only checked for "the client recovered once the link
 came back and nothing hung"; what the client does DURING the fault is
 recorded in the report, not asserted, because changing it is later work.
@@ -63,8 +66,31 @@ class AuthOverTopologyLiveTest(unittest.TestCase):
 
         replay = next(c for c in report["clients"] if c["group"] == "replay_same_process")["requests"]
         self.assertTrue(replay[0]["result"]["trusted"])
-        self.assertTrue(replay[1]["result"]["rejected_as_replay"])
+        self.assertTrue(replay[1]["result"]["challenge_mismatch"])
         self.assertFalse(replay[1]["result"]["trusted"])
+        # the case that came back TRUSTED before wire version 2
+        (fresh,) = next(c for c in report["clients"] if c["group"] == "replay_fresh_process")["requests"]
+        self.assertFalse(fresh["result"]["trusted"])
+        self.assertTrue(fresh["result"]["challenge_mismatch"])
+
+        ready = report["ready_at"]["idle"]
+        idle_clients = [c for c in report["clients"] if c["group"] == "idle_attack"]
+        self.assertEqual(len(idle_clients), len(SLICE_TYPES))
+        for client in idle_clients:
+            self.assertTrue(client["requests"][0]["result"]["trusted"], client)
+            # served while the attacker's connections were still held open
+            self.assertLess(client["wall_end"] - ready, cfg.server_connection_timeout)
+        idle_done = next(p for p in report["probes"] if "idle" in p["name"])["records"][-1]
+        self.assertEqual(idle_done["closed_by_server"], cfg.idle_attack_connections)
+        self.assertTrue(all(t >= cfg.server_connection_timeout for t in idle_done["closed_after_s"]))
+
+        malformed = next(p for p in report["probes"] if p["name"].startswith("malformed"))
+        self.assertTrue(malformed["server_alive_after"])
+        self.assertEqual(len(malformed["records"]), 9)
+        for client in (c for c in report["clients"] if c["group"] == "after_malformed"):
+            self.assertTrue(client["requests"][0]["result"]["trusted"], client)
+        self.assertNotIn("error:internal_error", report["server"]["events"])
+        self.assertGreater(report["server"]["sign_ms"]["n"], 0)
 
         rogue = {c["trust_mode"]: c["requests"][0]["result"] for c in report["clients"] if c["group"] == "rogue"}
         self.assertFalse(rogue["pinned"]["trusted"])

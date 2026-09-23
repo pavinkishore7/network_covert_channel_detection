@@ -172,6 +172,9 @@ class AuthTopologyConfig:
     link_fault_after: int = 2  # fault is applied after this many results
     link_fault_span: int = 2  # ... and removed after this many more
     link_fault_interval: float = 0.5
+    server_connection_timeout: float = 10.0  # ReauthServer drops a silent connection after this
+    idle_attack_connections: int = 8  # fewer than ReauthServer's default cap (32) -- see README
+    idle_attack_hold_s: float = 15.0  # > server_connection_timeout, so the server's drop is observed
     t0: float = 1_000_000.0  # logical clock for request `now` values
     now_step: float = 1000.0  # > every DEFAULT_POLICIES interval, so each request is due
 
@@ -212,6 +215,23 @@ def build_server_cmd(cfg: AuthTopologyConfig, endpoint: Endpoint, topo: NetnsTop
         "--bind", endpoint.ip(topo), "--port", str(cfg.port),
         "--key-path", str(cfg.key_path(endpoint)),
         "--audit-log", str(cfg.served_log(endpoint)),
+        "--server-id", cfg.server_id,
+        "--connection-timeout", repr(float(cfg.server_connection_timeout)),
+    ])
+
+
+def build_idle_attacker_cmd(cfg: AuthTopologyConfig, topo: NetnsTopology) -> list[str]:
+    return _in_netns(ROGUE.netns, [
+        cfg.python, "-m", "integration.auth_over_topology", "idle-attacker",
+        "--server", CORE.ip(topo), "--port", str(cfg.port),
+        "--connections", str(cfg.idle_attack_connections), "--hold", repr(float(cfg.idle_attack_hold_s)),
+    ])
+
+
+def build_malformed_probe_cmd(cfg: AuthTopologyConfig, topo: NetnsTopology) -> list[str]:
+    return _in_netns(ROGUE.netns, [
+        cfg.python, "-m", "integration.auth_over_topology", "malformed-probe",
+        "--server", CORE.ip(topo), "--port", str(cfg.port),
     ])
 
 
@@ -272,6 +292,10 @@ class Step:
     client        run ``argv`` to completion, collect one JSON line per request
     link_fault    run client ``argv``; after ``fault_after`` lines run
                   ``fault_cmds``, after ``fault_span`` more run ``restore_cmds``
+    finish        wait for a started process to exit on its own; keep its JSON output
+    probe         run ``argv`` to completion, keep its JSON lines, check a
+                  started process is still alive afterwards
+    server_stats  summarize a server's served-request log
     audit         run ``argv`` (pqc_auth.audit_verify) and record its verdict
     """
 
@@ -324,9 +348,9 @@ def build_plan(cfg: AuthTopologyConfig, topo: NetnsTopology) -> list[Step]:
 
     # a. Replay. The attacker endpoint serves whatever response the client
     # captured from the real server. Case 1: the SAME client process that
-    # accepted it is sent it again (--then) -- must be rejected_as_replay.
-    # Case 2: a FRESH client process gets it -- recorded as-is, because the
-    # client's seen-nonce memory is per process (see the README).
+    # accepted it gets it again (--then). Case 2: a FRESH client process gets
+    # it -- the case that came back TRUSTED before wire version 2. Both
+    # requests carry a new challenge, so both must be challenge_mismatch.
     replay_slice = topo.slices[0]
     steps.append(Step("start", "replay responder (adversary)", argv=tuple(build_replay_responder_cmd(cfg, topo)), meta={"proc": "replay"}))
     argv = build_client_cmd(
@@ -349,6 +373,27 @@ def build_plan(cfg: AuthTopologyConfig, topo: NetnsTopology) -> list[Step]:
         steps.append(Step("client", f"rogue server: {rogue_slice} {trust_mode} -> rogue", argv=tuple(argv),
                           meta={"group": "rogue", "slice_type": rogue_slice, "trust_mode": trust_mode}))
 
+    # d. Idle attacker: ns-rogue opens connections to the core server and
+    # never sends a byte. Every slice must still be served while they are
+    # held; the attacker then reports when the server dropped each one.
+    steps.append(Step("start", "idle attacker connections (adversary)",
+                      argv=tuple(build_idle_attacker_cmd(cfg, topo)), meta={"proc": "idle"}))
+    for slice_type in topo.slices:
+        argv = build_client_cmd(cfg, topo, slice_type, "pinned", server=core_ip, port=cfg.port, now=advance(1))
+        steps.append(Step("client", f"during idle attack: {slice_type} -> core", argv=tuple(argv),
+                          meta={"group": "idle_attack", "slice_type": slice_type, "trust_mode": "pinned"}))
+    steps.append(Step("finish", "idle attacker: wait for its connections to end",
+                      meta={"proc": "idle", "timeout_s": cfg.idle_attack_hold_s + 10}))
+
+    # e. Malformed requests from ns-rogue; the server must survive every one
+    # and keep serving every slice.
+    steps.append(Step("probe", "malformed requests from ns-rogue", argv=tuple(build_malformed_probe_cmd(cfg, topo)),
+                      meta={"alive_proc": "core"}))
+    for slice_type in topo.slices:
+        argv = build_client_cmd(cfg, topo, slice_type, "pinned", server=core_ip, port=cfg.port, now=advance(1))
+        steps.append(Step("client", f"after malformed probe: {slice_type} -> core", argv=tuple(argv),
+                          meta={"group": "after_malformed", "slice_type": slice_type, "trust_mode": "pinned"}))
+
     # c. Link failure mid-run: one client doing periodic re-auth; the path is
     # cut after `link_fault_after` results and restored `link_fault_span`
     # results later. Nothing here changes what the client does about it.
@@ -368,6 +413,8 @@ def build_plan(cfg: AuthTopologyConfig, topo: NetnsTopology) -> list[Step]:
             },
         ))
 
+    steps.append(Step("server_stats", "core server: measured sign/verify time + refusals",
+                      meta={"served_log": str(cfg.served_log(CORE))}))
     steps.append(Step("audit", "pqc_auth.audit_verify on the client log",
                       argv=(cfg.python, "-m", "pqc_auth.audit_verify", str(cfg.client_audit_log))))
     return steps
@@ -464,7 +511,8 @@ class AuthOverTopologyRunner:
         self._popen = popen or _default_popen
         self._log = log
         self.procs: dict[str, _Proc] = {}
-        self.report: dict[str, Any] = {"steps": [], "clients": [], "audit": None, "teardown": None, "error": None}
+        self.report: dict[str, Any] = {"steps": [], "clients": [], "probes": [], "server": None,
+                                       "audit": None, "teardown": None, "error": None}
 
     # public ---------------------------------------------------------------
 
@@ -541,6 +589,7 @@ class AuthOverTopologyRunner:
                 raise PlanStepError(f"{step.name}: exited before READY; output: {proc.transcript}")
             if line.startswith("READY"):
                 self._log(f"    {line}")
+                self.report.setdefault("ready_at", {})[step.meta["proc"]] = time.time()
                 return
 
     def _step_export_pubkey(self, step: Step) -> None:
@@ -548,16 +597,19 @@ class AuthOverTopologyRunner:
         shutil.copyfile(step.meta["src"], step.meta["dst"])
 
     def _step_client(self, step: Step) -> None:
+        wall_start = time.time()
         started = time.monotonic()
         try:
             result = self._run(list(step.argv), timeout=self.cfg.hang_timeout_s)
         except subprocess.TimeoutExpired as exc:
             output = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             self._record(step, _parse_client_lines(output.splitlines()),
-                         hung_after_s=time.monotonic() - started, exit_code=None)
+                         hung_after_s=time.monotonic() - started, exit_code=None,
+                         wall_start=wall_start, wall_end=time.time())
             return
         self._record(step, _parse_client_lines((result.stdout or "").splitlines()), exit_code=result.returncode,
-                     stderr=[l for l in (result.stderr or "").splitlines() if not _is_noise(l)][-5:])
+                     stderr=[l for l in (result.stderr or "").splitlines() if not _is_noise(l)][-5:],
+                     wall_start=wall_start, wall_end=time.time())
 
     def _step_link_fault(self, step: Step) -> None:
         proc = _Proc(self._popen(list(step.argv)))
@@ -604,6 +656,43 @@ class AuthOverTopologyRunner:
         self._record(step, records, exit_code=exit_code, events=events,
                      hung_after_s=(time.monotonic() - started) if hung else None)
 
+    def _step_finish(self, step: Step) -> None:
+        proc = self.procs[step.meta["proc"]]
+        deadline = time.monotonic() + step.meta["timeout_s"]
+        timed_out = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                if proc.next_line(timeout=remaining) is None:
+                    break
+            except queue.Empty:
+                continue
+        returncode = proc.stop()
+        records = _parse_client_lines(proc.transcript)
+        self.report["probes"].append({"name": step.name, "records": records, "exit_code": returncode, "timed_out": timed_out})
+        for r in records:
+            self._log(f"    {json.dumps(r, sort_keys=True)}")
+
+    def _step_probe(self, step: Step) -> None:
+        result = self._run(list(step.argv), timeout=self.cfg.hang_timeout_s)
+        records = _parse_client_lines((result.stdout or "").splitlines())
+        alive = None
+        if step.meta.get("alive_proc") in self.procs:
+            alive = self.procs[step.meta["alive_proc"]].handle.poll() is None
+        self.report["probes"].append({"name": step.name, "records": records, "exit_code": result.returncode,
+                                      "server_alive_after": alive})
+        for r in records:
+            self._log(f"    {json.dumps(r, sort_keys=True)}")
+        self._log(f"    server still running: {alive}")
+
+    def _step_server_stats(self, step: Step) -> None:
+        path = Path(step.meta["served_log"])
+        records = [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+        self.report["server"] = summarize_served_log(records)
+
     def _step_audit(self, step: Step) -> None:
         result = self._run(list(step.argv), timeout=self.cfg.hang_timeout_s)
         lines = [l for l in (result.stdout or "").splitlines() if not _is_noise(l)]
@@ -641,7 +730,8 @@ def _describe_request(r: dict) -> str:
     if r.get("error"):
         return f"{head}: EXCEPTION {r['error']['type']}: {r['error']['message']} (after {r['elapsed_ms']:.0f} ms)"
     res = r["result"]
-    flags = [k for k in ("rejected_as_replay", "pinned_key_mismatch", "trust_store_key_changed") if res.get(k)]
+    flags = [k for k in ("challenge_mismatch", "rejected_as_replay", "pinned_key_mismatch", "trust_store_key_changed",
+                         "malformed_response") if res.get(k)]
     verdict = "TRUSTED" if res.get("trusted") else ("not due" if not res.get("due") else "REJECTED")
     return f"{head}: {verdict}{' (' + ', '.join(flags) + ')' if flags else ''} rtt={r['rtt_ms']:.2f} ms"
 
@@ -664,6 +754,31 @@ def summarize_rtts(report: dict) -> dict[str, dict[str, float]]:
     return out
 
 
+def _stats(values: Sequence[float]) -> dict[str, float] | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    p95 = ordered[min(len(ordered) - 1, round(0.95 * (len(ordered) - 1)))]
+    return {"n": len(ordered), "min_ms": ordered[0], "median_ms": statistics.median(ordered),
+            "p95_ms": p95, "max_ms": ordered[-1]}
+
+
+def summarize_served_log(records: Sequence[dict]) -> dict[str, Any]:
+    """Server-side sign/verify time as measured inside controller.reauth()
+    (time.perf_counter around signer.sign and signer.verify), plus a tally
+    of every non-served event by code."""
+    due = [r for r in records if r.get("event") == "served" and r.get("due")]
+    events: dict[str, int] = {}
+    for r in records:
+        key = r.get("event", "?") if r.get("event") != "error" else f"error:{r.get('code')}"
+        events[key] = events.get(key, 0) + 1
+    return {
+        "sign_ms": _stats([r["sign_ms"] for r in due if r.get("sign_ms") is not None]),
+        "verify_ms": _stats([r["verify_ms"] for r in due if r.get("verify_ms") is not None]),
+        "events": dict(sorted(events.items())),
+    }
+
+
 def format_summary(report: dict) -> str:
     lines = ["", "=" * 72, "AUTH OVER TOPOLOGY -- SUMMARY", "=" * 72]
     lines.append("Per-slice verification (legit batches):")
@@ -678,16 +793,34 @@ def format_summary(report: dict) -> str:
     for c in report["clients"]:
         if c.get("group") == "legit":
             continue
-        lines.append(f"  {c['name']}:")
+        timing = ""
+        ready = (report.get("ready_at") or {}).get("idle")
+        if c.get("group") == "idle_attack" and ready is not None and "wall_start" in c:
+            timing = f" (ran t=+{c['wall_start'] - ready:.2f}..+{c['wall_end'] - ready:.2f} s after the idle attacker's READY)"
+        lines.append(f"  {c['name']}:{timing}")
         for e in c.get("events", []):
             lines.append(f"      -- {e['event']} at t={e['t_s']}s")
         for r in c["requests"]:
             lines.append(f"      {_describe_request(r)}")
         if c.get("hung_after_s") is not None:
             lines.append(f"      HUNG: killed by orchestrator after {c['hung_after_s']:.1f}s")
+    for probe in report.get("probes", []):
+        lines.append(f"  {probe['name']}:" + (" (t measured from the attacker's own start)" if "idle" in probe["name"] else ""))
+        for r in probe["records"]:
+            lines.append(f"      {json.dumps(r, sort_keys=True)}")
+        if probe.get("server_alive_after") is not None:
+            lines.append(f"      server process still running afterwards: {probe['server_alive_after']}")
+    server = report.get("server") or {}
+    for key in ("sign_ms", "verify_ms"):
+        s = server.get(key)
+        if s:
+            lines.append(f"server {key[:-3]} (ML-DSA-65, measured in-process): n={s['n']} min={s['min_ms']:.3f} "
+                         f"median={s['median_ms']:.3f} p95={s['p95_ms']:.3f} max={s['max_ms']:.3f} ms")
+    if server.get("events"):
+        lines.append(f"server events: {server['events']}")
     lines.append("RTT per slice (veth-in-a-VM: signature + transport overhead on a software topology;")
     lines.append("NOT radio/5G latency, NOT comparable to TS 22.261 URLLC targets):")
-    for slice_type, s in summarize_rtts(report).items():
+    for slice_type, s in summarize_rtts(report).items():  # legit batches only
         lines.append(f"  {slice_type:<5} n={s['n']:<3} min={s['min_ms']:.2f}  median={s['median_ms']:.2f}  "
                      f"p95={s['p95_ms']:.2f}  max={s['max_ms']:.2f} ms")
     audit = report.get("audit") or {}
@@ -733,6 +866,77 @@ def serve_replay(bind: str, port: int, response_file: str) -> int:
     return 0
 
 
+# -- the idle attacker and the malformed-request probe ----------------------
+
+
+def run_idle_attacker(server: str, port: int, connections: int, hold_s: float) -> int:
+    """Open ``connections`` TCP connections, send nothing, and report when
+    (if ever) the server closes each one within ``hold_s`` seconds."""
+    import select
+
+    started = time.monotonic()
+    socks = [socket.create_connection((server, port), timeout=5.0) for _ in range(connections)]
+    print("READY " + json.dumps({"role": "idle-attacker", "opened": len(socks)}), flush=True)
+    closed_after: list[float | None] = [None] * len(socks)
+    while time.monotonic() - started < hold_s and any(c is None for c in closed_after):
+        open_socks = [s for s, c in zip(socks, closed_after) if c is None]
+        readable, _, _ = select.select(open_socks, [], [], 0.2)
+        for s in readable:
+            try:
+                data = s.recv(1)
+            except OSError:
+                data = b""
+            if not data:
+                closed_after[socks.index(s)] = round(time.monotonic() - started, 3)
+    for s in socks:
+        s.close()
+    print(json.dumps({"event": "idle_attacker_done", "connections": len(socks), "held_up_to_s": hold_s,
+                      "closed_by_server": sum(c is not None for c in closed_after),
+                      "closed_after_s": closed_after}), flush=True)
+    return 0
+
+
+def _malformed_cases() -> list[tuple[str, bytes, bool]]:
+    challenge = "00" * 32
+    return [
+        ("oversized, no newline (5000 B)", b"x" * 5000, False),
+        ("non-UTF-8 bytes", b"\xff\xfe\xfd\n", False),
+        ("invalid JSON", b"{not json\n", False),
+        ("JSON array", b"[1, 2, 3]\n", False),
+        ("wire v1 request", b'{"slice_type": "URLLC", "now": 0}\n', False),
+        ("unknown slice type", json.dumps({"v": 2, "slice_type": "6G", "now": 0, "client_challenge": challenge}).encode() + b"\n", False),
+        ("NaN now", b'{"v": 2, "slice_type": "URLLC", "now": NaN, "client_challenge": "' + challenge.encode() + b'"}\n', False),
+        ("4-byte challenge", json.dumps({"v": 2, "slice_type": "URLLC", "now": 0, "client_challenge": "00" * 4}).encode() + b"\n", False),
+        ("truncated (peer half-closes mid-line)", b'{"v": 2, "slice_ty', True),
+    ]
+
+
+def run_malformed_probe(server: str, port: int) -> int:
+    for label, payload, half_close in _malformed_cases():
+        started = time.monotonic()
+        try:
+            with socket.create_connection((server, port), timeout=5.0) as s:
+                s.sendall(payload)
+                if half_close:
+                    s.shutdown(socket.SHUT_WR)
+                chunks = []
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            raw = b"".join(chunks)
+            try:
+                reply = json.loads(raw).get("error") if raw else "connection closed, no reply"
+            except ValueError:
+                reply = repr(raw[:80])
+        except OSError as exc:
+            reply = f"{type(exc).__name__}: {exc}"
+        print(json.dumps({"case": label, "server_reply": reply,
+                          "elapsed_ms": round((time.monotonic() - started) * 1000, 1)}), flush=True)
+    return 0
+
+
 # -- CLI -----------------------------------------------------------------------
 
 
@@ -748,10 +952,22 @@ def main(argv: list[str] | None = None) -> int:
     rr.add_argument("--bind", required=True)
     rr.add_argument("--port", type=int, required=True)
     rr.add_argument("--response-file", required=True)
+    ia = sub.add_parser("idle-attacker", help="adversary: hold silent connections; used by the plan itself")
+    ia.add_argument("--server", required=True)
+    ia.add_argument("--port", type=int, required=True)
+    ia.add_argument("--connections", type=int, required=True)
+    ia.add_argument("--hold", type=float, required=True)
+    mp = sub.add_parser("malformed-probe", help="adversary: send malformed requests; used by the plan itself")
+    mp.add_argument("--server", required=True)
+    mp.add_argument("--port", type=int, required=True)
     args = parser.parse_args(argv)
 
     if args.command == "replay-responder":
         return serve_replay(args.bind, args.port, args.response_file)
+    if args.command == "idle-attacker":
+        return run_idle_attacker(args.server, args.port, args.connections, args.hold)
+    if args.command == "malformed-probe":
+        return run_malformed_probe(args.server, args.port)
 
     import tempfile
 

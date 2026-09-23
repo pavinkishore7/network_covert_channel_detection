@@ -63,7 +63,7 @@ from pathlib import Path
 
 from pqc_auth.audit_verify import format_report, verify_log
 from pqc_auth.reauth import DualTriggerReauthController
-from pqc_auth.transport import ReauthClient, ReauthServer
+from pqc_auth.transport import ReauthClient, ReauthServer, signed_message
 from pqc_auth.trust_store import TrustStore
 
 DEMO_STATE_DIR = Path(__file__).parent / ".demo_state"
@@ -137,7 +137,8 @@ def _print_result(label: str, result) -> None:
         f"  [{label}] due=True reason={result.reason.value} "
         f"trusted={result.trusted} replay_rejected={result.rejected_as_replay} "
         f"pinned_key_mismatch={result.pinned_key_mismatch} "
-        f"trust_store_key_changed={result.trust_store_key_changed}"
+        f"trust_store_key_changed={result.trust_store_key_changed} "
+        f"challenge_mismatch={result.challenge_mismatch}"
     )
 
 
@@ -235,7 +236,7 @@ def main() -> None:
         _print_result("URLLC t=8  alert (in cooldown)", client.request_reauth("URLLC", 8, detector_alert=True))
 
         print("\n3) Tampering and replay are both independently rejected by the CLIENT")
-        captured = client._send_request("mMTC", 0, detector_alert=False)
+        captured, challenge = client._send_request("mMTC", 0, detector_alert=False)
 
         # Check the tampered copy FIRST, before the genuine nonce is ever
         # marked as seen -- otherwise this would be rejected as a replay
@@ -245,18 +246,20 @@ def main() -> None:
         tampered_sig = bytearray(bytes.fromhex(tampered["signature"]))
         tampered_sig[0] ^= 0xFF
         tampered["signature"] = tampered_sig.hex()
-        _print_result("mMTC  t=0  tampered signature ", client.process_response(tampered, now=0))
+        _print_result("mMTC  t=0  tampered signature ", client.process_response(tampered, now=0, expected_challenge=challenge))
 
-        _print_result("mMTC  t=1  genuine response   ", client.process_response(captured, now=1))
-        _print_result("mMTC  t=2  replay of t=1 msg  ", client.process_response(captured, now=2))
+        _print_result("mMTC  t=1  genuine response   ", client.process_response(captured, now=1, expected_challenge=challenge))
+        # The replay answers a LATER request, which carried a new challenge.
+        later_challenge = b"\x5a" * 32
+        _print_result("mMTC  t=2  replay of t=1 msg  ", client.process_response(captured, now=2, expected_challenge=later_challenge))
 
         print("\n4) A SECOND, different signer's genuinely valid signature is rejected by PINNING")
         impersonator = _make_impersonator_signer(backend_label)
         # detector_alert=True so this is due regardless of eMBB's periodic
         # schedule (already used at t=0 in step 1, and not due again for
         # 90s) -- the alert trigger has its own, much shorter cooldown.
-        genuine = client._send_request("eMBB", 20, detector_alert=True)
-        nonce = bytes.fromhex(genuine["nonce"])
+        genuine, challenge = client._send_request("eMBB", 20, detector_alert=True)
+        nonce = signed_message(genuine["payload"])  # the exact bytes a v2 signature covers
         impersonated = dict(genuine)
         impersonated["signature"] = impersonator.sign(nonce).hex()
         impersonated["public_key"] = impersonator.public_key.hex()
@@ -269,7 +272,7 @@ def main() -> None:
             f"ITS OWN key: {impersonator_signature_is_genuinely_valid} -- "
             f"this is a real signature, not a broken one)"
         )
-        _print_result("eMBB  t=20 impersonator's key ", client.process_response(impersonated, now=20))
+        _print_result("eMBB  t=20 impersonator's key ", client.process_response(impersonated, now=20, expected_challenge=challenge))
 
         _demo_tofu_pinning(server, signer, verify_fn, backend_label)
     finally:

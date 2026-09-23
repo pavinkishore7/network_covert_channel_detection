@@ -75,6 +75,9 @@ class AuditLogger:
         rejected_as_replay: bool,
         pinned_key_mismatch: bool = False,
         trust_store_key_changed: bool = False,
+        challenge_mismatch: bool = False,
+        signed_payload: str | None = None,
+        expected_challenge: bytes | None = None,
     ) -> dict:
         """Append one record and return it as the dict that was written.
 
@@ -84,6 +87,15 @@ class AuditLogger:
         shape without any change on their part. ``trust_store_key_changed``
         follows the identical convention for TOFU pinning
         (pqc_auth/trust_store.py): existing callers/records are unaffected.
+
+        ``signed_payload`` / ``expected_challenge`` belong to wire version 2
+        (see pqc_auth/transport.py): the exact payload string the signature
+        covers, and the challenge the client sent in its request. When
+        given, both are written, together with ``challenge_mismatch``, so
+        pqc_auth/audit_verify.py can recompute the signature over the real
+        signed bytes and independently re-check the challenge comparison.
+        When omitted, none of the three is written and the record keeps the
+        pre-v2 shape, in which the signature covers ``nonce`` alone.
         """
         fields = {
             "seq": self._next_seq,
@@ -100,6 +112,14 @@ class AuditLogger:
             "trust_store_key_changed": bool(trust_store_key_changed),
             "prev_hash": self._prev_line_hash,
         }
+        if signed_payload is not None:
+            if expected_challenge is None:
+                raise ValueError("signed_payload requires expected_challenge")
+            fields["signed_payload"] = signed_payload
+            fields["expected_challenge"] = expected_challenge.hex()
+            fields["challenge_mismatch"] = bool(challenge_mismatch)
+        elif challenge_mismatch:
+            raise ValueError("challenge_mismatch requires signed_payload and expected_challenge")
         record_hash = hashlib.sha256(canonical_json(fields).encode("utf-8")).hexdigest()
         record = {**fields, "record_hash": record_hash}
         line = canonical_json(record).encode("utf-8")
