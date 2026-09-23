@@ -59,16 +59,33 @@ What this does NOT do (see pqc_auth/README.md for the fuller list):
     signature is the only integrity guarantee, there is no confidentiality
     or anti-tampering on the request itself (a request only carries
     slice_type/now/detector_alert, none of which are secret).
-  - No multi-client or multi-server topology; one server, sequential
-    connections, localhost only.
+  - No concurrent connection handling: one server thread, connections
+    served strictly one at a time. Host/port default to loopback; binding
+    elsewhere (e.g. inside a network namespace, see the CLI below and
+    integration/auth_over_topology.py) is the caller's choice.
+
+Command-line entry point (so a server or client can run as its own process,
+e.g. inside a network namespace via ``ip netns exec <ns> ...``)::
+
+    python -m pqc_auth.transport serve --bind ADDR --port P --key-path DIR [--audit-log FILE]
+    python -m pqc_auth.transport request --server ADDR --port P --slice-type S \
+        (--expected-pubkey-file FILE | --trust-store FILE --server-id ID) [...]
+
+Both use the real ``OqsDilithiumSigner``/``verify_with_public_key`` and
+therefore need liboqs. See ``main()`` for every flag.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import signal
 import socket
+import sys
 import threading
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Callable
 
 from pqc_auth.audit_log import AuditLogger
@@ -106,10 +123,23 @@ class ReauthServer:
     """Listens on a local TCP socket and answers re-auth requests for a
     controller that has a signing-capable Signer configured."""
 
-    def __init__(self, controller: DualTriggerReauthController, host: str = "127.0.0.1", port: int = 0):
+    def __init__(
+        self,
+        controller: DualTriggerReauthController,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        served_log_path: str | None = None,
+    ):
         if controller.signer is None:
             raise ValueError("ReauthServer requires a controller with a signer configured")
         self.controller = controller
+        # Optional plain-JSONL record of every request this server answered
+        # (peer, slice_type, now, due, reason, nonce). NOT hash-chained and
+        # NOT an input to pqc_auth/audit_verify.py -- that tool audits the
+        # CLIENT's verification log, which is where trust decisions are
+        # made. This one only lets an operator correlate "what the server
+        # signed" with "what a client accepted". None = no file side effects.
+        self._served_log_path = Path(served_log_path) if served_log_path is not None else None
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((host, port))
@@ -173,6 +203,26 @@ class ReauthServer:
                 "slice_type": request["slice_type"],
             }
         _send_line(conn, json.dumps(response).encode())
+        if self._served_log_path is not None:
+            self._log_served(conn, request, response)
+
+    def _log_served(self, conn: socket.socket, request: dict, response: dict) -> None:
+        try:
+            peer = "%s:%d" % conn.getpeername()[:2]
+        except OSError:
+            peer = None
+        record = {
+            "timestamp": time.time(),
+            "peer": peer,
+            "slice_type": request["slice_type"],
+            "now": request["now"],
+            "detector_alert": request.get("detector_alert", False),
+            "due": response["due"],
+            "reason": response.get("reason"),
+            "nonce": response.get("nonce"),
+        }
+        with self._served_log_path.open("a") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -394,3 +444,155 @@ class ReauthClient:
         expired = [nonce for nonce, seen_at in self._seen_nonces.items() if seen_at < cutoff]
         for nonce in expired:
             del self._seen_nonces[nonce]
+
+
+# -- command-line entry point ----------------------------------------------
+
+
+def _serve_main(args: argparse.Namespace) -> int:
+    from pqc_auth.dilithium import OqsDilithiumSigner
+
+    signer = OqsDilithiumSigner(key_path=args.key_path)
+    server = ReauthServer(
+        DualTriggerReauthController(signer=signer), host=args.bind, port=args.port, served_log_path=args.audit_log
+    )
+
+    stop = threading.Event()
+
+    def _on_signal(signum, _frame):
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    server.start()
+    # One machine-readable line so whoever launched this process (e.g.
+    # integration/auth_over_topology.py) knows the socket is listening
+    # before it points any client at it.
+    ready = {"host": server.host, "port": server.port, "backend": server.backend_name, "key_path": args.key_path}
+    print("READY " + json.dumps(ready), flush=True)
+    try:
+        while not stop.wait(0.5):
+            if server._thread is not None and not server._thread.is_alive():
+                # The serve thread died (e.g. an unhandled exception while
+                # handling one connection). Exit visibly rather than keep a
+                # listening socket that will never answer.
+                print("SERVER_THREAD_DIED", flush=True)
+                return 1
+    finally:
+        server.stop()
+    return 0
+
+
+def _parse_target(value: str) -> tuple[str, int]:
+    host, _, port = value.rpartition(":")
+    if not host or not port.isdigit():
+        raise argparse.ArgumentTypeError(f"expected HOST:PORT, got {value!r}")
+    return host, int(port)
+
+
+def _request_main(args: argparse.Namespace) -> int:
+    import oqs  # noqa: F401  # type: ignore[import-not-found]
+
+    from pqc_auth.dilithium import verify_with_public_key
+
+    # verify_with_public_key imports oqs lazily on its first call; importing
+    # it here first keeps that one-time module load (~0.9 s measured on the
+    # dev machine) out of the first request's rtt_ms.
+    expected_public_key = (
+        Path(args.expected_pubkey_file).read_bytes() if args.expected_pubkey_file is not None else None
+    )
+    client = ReauthClient(
+        args.server,
+        args.port,
+        verify_fn=verify_with_public_key,
+        expected_public_key=expected_public_key,
+        trust_store_path=args.trust_store,
+        server_id=args.server_id,
+        timeout=args.timeout,
+        audit_log_path=args.audit_log,
+    )
+
+    # Every request is made by this ONE client instance, so its in-memory
+    # replay window (seen nonces) is shared across them -- which is what
+    # lets a --then follow-up to a replaying endpoint be judged against
+    # nonces this same client already accepted.
+    targets = [(args.server, args.port)] * args.count + list(args.then)
+    exit_code = 0
+    for index, (host, port) in enumerate(targets):
+        if index > 0 and args.interval > 0:
+            time.sleep(args.interval)
+        client.host, client.port = host, port
+        now = args.now + index * args.now_step
+        record = {"index": index, "target": f"{host}:{port}", "slice_type": args.slice_type, "now": now}
+        started = time.perf_counter()
+        try:
+            response = client._send_request(args.slice_type, now, args.detector_alert)
+            if index == 0 and args.capture_response is not None:
+                Path(args.capture_response).write_text(json.dumps(response))
+            result = client.process_response(response, now)
+        except Exception as exc:  # noqa: BLE001 - record what ReauthClient raises, verbatim
+            record.update(
+                error={"type": type(exc).__name__, "message": str(exc)},
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            exit_code = 1
+        else:
+            fields = asdict(result)
+            fields["reason"] = result.reason.value if result.reason is not None else None
+            record.update(result=fields, error=None, rtt_ms=(time.perf_counter() - started) * 1000.0)
+        print(json.dumps(record, sort_keys=True), flush=True)
+    return exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m pqc_auth.transport")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    serve = sub.add_parser("serve", help="run a ReauthServer (real OqsDilithiumSigner) until SIGTERM/SIGINT")
+    serve.add_argument("--bind", default="127.0.0.1", help="address to bind (default: loopback)")
+    serve.add_argument("--port", type=int, default=0, help="port to bind (default 0 = ephemeral)")
+    serve.add_argument("--key-path", required=True, help="OqsDilithiumSigner key_path directory (created/persisted)")
+    serve.add_argument(
+        "--audit-log",
+        default=None,
+        help="server-side served-request log (plain JSONL, not hash-chained; audit_verify runs on the CLIENT log)",
+    )
+
+    req = sub.add_parser("request", help="run a ReauthClient: request, independently verify, print one JSON line each")
+    req.add_argument("--server", default="127.0.0.1", help="server address (default: loopback)")
+    req.add_argument("--port", type=int, required=True)
+    req.add_argument("--slice-type", required=True)
+    trust = req.add_mutually_exclusive_group(required=True)
+    trust.add_argument("--expected-pubkey-file", help="explicit pin: raw public key bytes obtained out of band")
+    trust.add_argument("--trust-store", help="TOFU trust store path (requires --server-id)")
+    req.add_argument("--server-id", help="TOFU server identity (requires --trust-store)")
+    req.add_argument("--audit-log", default=None, help="client verification audit log (hash-chained JSONL)")
+    req.add_argument("--now", type=float, default=None, help="logical time of the first request (default: time.time())")
+    req.add_argument("--now-step", type=float, default=0.0, help="added to --now for each successive request")
+    req.add_argument("--count", type=int, default=1, help="requests to --server/--port with this one client")
+    req.add_argument("--interval", type=float, default=0.0, help="real seconds to sleep between requests")
+    req.add_argument("--detector-alert", action="store_true")
+    req.add_argument("--timeout", type=float, default=5.0, help="ReauthClient socket timeout (default: its own 5.0)")
+    req.add_argument(
+        "--then",
+        type=_parse_target,
+        action="append",
+        default=[],
+        metavar="HOST:PORT",
+        help="after --count requests, send one more request per HOST:PORT with the SAME client instance",
+    )
+    req.add_argument("--capture-response", default=None, help="write the first raw response JSON to this file")
+
+    args = parser.parse_args(argv)
+    if args.command == "serve":
+        return _serve_main(args)
+    if args.trust_store is not None and args.server_id is None:
+        parser.error("--trust-store requires --server-id")
+    if args.now is None:
+        args.now = time.time()
+    return _request_main(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

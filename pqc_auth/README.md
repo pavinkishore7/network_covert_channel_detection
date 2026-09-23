@@ -281,11 +281,13 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   *manually* accept a new key for an already-known `server_id`, but there
   is no automatic distinction between a legitimate rotation and an
   attacker's key, and no revocation mechanism of any kind.
-- **The transport is localhost-only** and has not been run over the real
-  network-namespace topology being built separately in this project. It
-  proves the challenge-response and replay-rejection logic work over an
-  actual socket, not that they work across the slices' real network
-  boundaries.
+- **The transport defaults to localhost, and has now been run across the
+  real namespace topology**, with server and clients as separate processes
+  in separate namespaces, via `python -m pqc_auth.transport serve|request`
+  (see `main()` in `transport.py`) and `integration/auth_over_topology.py`.
+  See `integration/README.md` for what that run showed: replay/rogue
+  outcomes, what a client does when the link dies, the per-process
+  replay-window gap, and latency caveats.
 - **No production-grade connection handling.** No retries on a dropped
   connection, no reconnection logic, no timeout tuning beyond a flat
   per-call socket timeout, and no transport-layer security beyond the
