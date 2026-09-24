@@ -235,8 +235,8 @@ window's packet rate: one bit per packet.
 | Slice | σ of clean gaps (ms) | window length (300 packets) | false-alarm rate % [95% CI] |
 |---|---|---|---|
 | URLLC | 10.24 | 4.26 s | 0.8 [0.2, 2.0] |
-| eMBB | 25.73 | 6.18 s | 1.6 [0.7, 3.1] |
-| mMTC | 41.09 | 8.00 s | 1.6 [0.7, 3.1] |
+| eMBB | 25.73 | 6.18 s | 1.2 [0.4, 2.6] |
+| mMTC | 41.09 | 8.00 s | 1.2 [0.4, 2.6] |
 
 **Reading the numbers.**
 
@@ -244,7 +244,7 @@ window's packet rate: one bit per packet.
   every slice** (URLLC 1.0 ms, eMBB 2.6 ms, mMTC 4.1 ms), for both
   injectors. The lower CI bound is also at or above 95% at 0.1σ.
 - **This sweep does not locate where detection breaks down**; that lies
-  below 0.1σ. The earlier 30-trial table's 0.6 ms "marginal" offset was
+  below 0.1σ (located in "Where detection breaks down" below). The earlier 30-trial table's 0.6 ms "marginal" offset was
   about 0.015σ on mMTC, which is consistent with the 40% detection it
   showed there.
 - **The adaptive injector barely lowers its perturbation.** Its mean
@@ -253,10 +253,17 @@ window's packet rate: one bit per packet.
   So explanation (a) holds: **the adaptive variant is weak**. This sweep
   does not show that the detector is robust to a genuinely adaptive
   attacker.
-- **The measured false-alarm rate (0.8–1.6%) is below the nominal 5%.**
+- **The measured false-alarm rate (0.8–1.2%) is below the nominal 5%.**
   The KS statistic is discrete (steps of 1/300), the decision uses a
   strict `>`, and every window is compared against one fixed baseline
   window. The measured rate is the one to use.
+- **Decisions are exact (since 2026-09-24).** D and the threshold both live on
+  the k/300 grid, so windows with D exactly on the threshold used to be decided
+  by the last bit of floating-point arithmetic, and rates differed between
+  scipy/numpy versions. `TimingKSDetector` now compares integer lattice counts
+  (round(D·lcm(n, m)) against the calibrated count), so every rate here is
+  machine-independent. Regenerating with the exact rule changed only the eMBB
+  and mMTC false-alarm rates (1.6% → 1.2%); no detection rate changed.
 
 A real clean-vs-covert gap-distribution comparison, generated from an
 actual run of `covert_demo.plot_clean_vs_covert` against real synthetic
