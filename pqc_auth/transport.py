@@ -523,7 +523,12 @@ class ReauthServer:
             )
             signature, sign_ms = self._sign(payload)
             verify_ms = None
-        _send_line(conn, json.dumps(self._signed_response(payload, signature)).encode())
+        response_line = json.dumps(self._signed_response(payload, signature)).encode()
+        # Log, then send (as _refuse() does): once the client holds the
+        # answer, the "served" record is already on disk, so anyone reading
+        # the log after a response arrived sees it. Logging after the send
+        # raced with such readers. If the send then fails, a send_failed
+        # record follows and corrects the "served" line.
         self._record(
             addr, "served",
             slice_type=request["slice_type"], now=request["now"], detector_alert=request["detector_alert"],
@@ -534,6 +539,12 @@ class ReauthServer:
             sign_ms=sign_ms,
             verify_ms=verify_ms,
         )
+        try:
+            _send_line(conn, response_line)
+        except OSError as exc:
+            self._record(addr, "error", code="send_failed", server_nonce=nonce.hex(),
+                         detail=f"{type(exc).__name__}: {exc}"[:200])
+            raise
 
     def _sign(self, payload: str) -> tuple[bytes, float]:
         started = time.perf_counter()
