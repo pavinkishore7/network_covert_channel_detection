@@ -109,11 +109,42 @@ def tables_md():
     (OUT / "tables.md").write_text("\n".join(lines) + "\n")
 
 
+def fig_net_detection_vs_offset():
+    p = R / "phase2_sweep_extended.csv"
+    if not p.exists():
+        print("skip network sweep (no CSV)")
+        return
+    d = pd.read_csv(p)
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10.5, 4.3), sharey=True)
+    styles = {"URLLC": ("k", "o"), "eMBB": ("0.45", "s"), "mMTC": ("0.7", "^")}
+    for sl, (c, m) in styles.items():
+        for inj, ls in (("non_adaptive", "-"), ("adaptive", "--")):
+            g = d[(d.part == "a_offsets") & (d.slice == sl) & (d.injector == inj)].sort_values("offset_over_sigma")
+            a1.errorbar(g.offset_over_sigma, g.detection_rate, yerr=[g.detection_rate - g.det_ci_low, g.det_ci_high - g.detection_rate],
+                        color=c, marker=m, ls=ls, capsize=2, ms=4, label=f"{sl}, {inj.replace('_', '-')}")
+        for k, ls in ((0.05, "--"), (0.1, "-")):
+            g = d[(d.part == "b_jitter") & (d.slice == sl) & (d.offset_over_sigma == k)].sort_values("steady_jitter_frac")
+            a2.errorbar(g.steady_jitter_frac, g.detection_rate, yerr=[g.detection_rate - g.det_ci_low, g.det_ci_high - g.detection_rate],
+                        color=c, marker=m, ls=ls, capsize=2, ms=4, label=f"{sl}, {k}σ")
+    a1.set_xscale("log")
+    a1.set(xlabel="covert delay offset / σ (overall gap std, log scale)", ylabel="detection rate (95% CI)",
+           title="Default traffic (steady jitter 5%)", ylim=(-0.03, 1.03))
+    a2.set_xscale("log")
+    a2.set_xticks([0.05, 0.1, 0.2, 0.5], ["5%", "10%", "20%", "50%"])
+    a2.set(xlabel="steady-component jitter (std / base gap)", title="Same absolute delay, noisier traffic (non-adaptive)")
+    a1.legend(fontsize=7, loc="upper left")
+    a2.legend(fontsize=7, loc="lower left")
+    fig.suptitle("KS timing-channel detection: 500 windows of 300 packets per point", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_net_detection_vs_offset.png", dpi=300)
+
+
 if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     fig_auc_vs_snr()
     fig_residual_comparison()
     fig_aggregation()
     fig_generalization()
+    fig_net_detection_vs_offset()
     tables_md()
     print("wrote", sorted(p.name for p in OUT.iterdir()))

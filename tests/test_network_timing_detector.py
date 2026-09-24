@@ -229,3 +229,22 @@ class OrchestrationCompatibilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_decision_is_exact_on_the_ks_lattice_and_ignores_float_noise():
+    """D and the calibrated threshold both live on the k/lcm(n, m) grid, so a window whose D
+    equals the threshold must be judged the same way whatever the last float bit says."""
+    import math as _math
+
+    import numpy as _np
+
+    from network_covert_channel.timing_detector import TimingKSDetector as _Det
+
+    det = _Det(seed=0)
+    det.calibrate(lambda: _np.random.default_rng().normal(size=300), n_trials=50, slice_type="URLLC")
+    thr_count, lattice = det._threshold_counts["URLLC"]
+    assert lattice == _math.lcm(300, 300) == 300
+    k = int(_np.ceil(thr_count))  # a lattice point at or above the threshold
+    on = k / 300
+    for noisy in (on, _np.nextafter(on, 0), _np.nextafter(on, 1), on + 1e-15, on - 1e-15):
+        assert det._exceeds(noisy, 300, 300, "URLLC") == (k > thr_count)

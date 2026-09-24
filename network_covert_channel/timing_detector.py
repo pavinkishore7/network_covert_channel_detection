@@ -82,6 +82,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+import math
+
 import numpy as np
 from scipy.stats import ks_2samp
 
@@ -110,12 +112,37 @@ class TimingKSDetector:
         # Per-slice thresholds: calibrate(..., slice_type=s). The only
         # thresholds anomaly_by_slice() ever reads.
         self.thresholds_: dict[str, float] = {}
+        # Exact decision state: the threshold expressed in units of 1/L, where L =
+        # lcm(n_observed, n_baseline) of the calibration windows. See _exceeds().
+        self._threshold_counts: dict[str | None, tuple[float, int]] = {}
 
     def statistic(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> float:
         """The KS D statistic (max absolute gap between the two empirical
         CDFs) between an observed sample and a clean baseline sample.
         Higher = more distributionally different = more anomalous."""
         return float(ks_2samp(observed_gaps, baseline_gaps).statistic)
+
+    @staticmethod
+    def _lattice(n_a: int, n_b: int) -> int:
+        """KS D between samples of sizes n_a and n_b is always an integer multiple of
+        1/lcm(n_a, n_b) (it is |i/n_a - j/n_b| for integers i, j), so D * lcm is an
+        integer up to floating-point error."""
+        return math.lcm(int(n_a), int(n_b))
+
+    @classmethod
+    def _count(cls, stat: float, n_a: int, n_b: int) -> int:
+        return int(round(stat * cls._lattice(n_a, n_b)))
+
+    def _exceeds(self, stat: float, n_a: int, n_b: int, slice_type: str | None) -> bool:
+        """Exact, machine-independent decision: compare the integer lattice count of D
+        with the calibrated threshold count. Comparing the float D directly with a float
+        threshold made windows whose D sits exactly on the threshold (which happens,
+        because both live on the same k/L grid) flip with the last bit of scipy/numpy
+        arithmetic, so detection and false-alarm rates differed between library versions
+        (found 2026-09-24: scipy 1.17.1 vs 1.18.0)."""
+        thr_count, lattice = self._threshold_counts[slice_type]
+        here = self._lattice(n_a, n_b)
+        return self._count(stat, n_a, n_b) > thr_count * here / lattice
 
     def calibrate(
         self,
@@ -144,12 +171,23 @@ class TimingKSDetector:
         """
         if not 0.0 < percentile <= 100.0:
             raise ValueError("percentile must be in (0, 100]")
-        null_stats = np.empty(n_trials)
+        null_counts = np.empty(n_trials)
+        lattice = None
         for i in range(n_trials):
             a = clean_gap_sampler()
             b = clean_gap_sampler()
-            null_stats[i] = self.statistic(a, b)
-        threshold = float(np.percentile(null_stats, percentile))
+            lat = self._lattice(len(a), len(b))
+            if lattice is None:
+                lattice = lat
+            elif lat != lattice:
+                raise ValueError("calibration sampler must return windows of a fixed size")
+            null_counts[i] = self._count(self.statistic(a, b), len(a), len(b))
+        # Percentile of exact integers: linear interpolation between two integers is either
+        # an exact integer (fraction 0) or strictly between them, so the later integer
+        # comparison has no float ties.
+        thr_count = float(np.percentile(null_counts, percentile))
+        self._threshold_counts[slice_type] = (thr_count, lattice)
+        threshold = thr_count / lattice
         if slice_type is None:
             self.threshold_ = threshold
         else:
@@ -172,14 +210,16 @@ class TimingKSDetector:
 
     def is_anomalous(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray,
                      slice_type: str | None = None) -> bool:
-        threshold = self.threshold_for(slice_type)
-        return self.statistic(observed_gaps, baseline_gaps) > threshold
+        self.threshold_for(slice_type)  # raises if uncalibrated
+        stat = self.statistic(observed_gaps, baseline_gaps)
+        return self._exceeds(stat, len(observed_gaps), len(baseline_gaps), slice_type)
 
     def score(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray,
               slice_type: str | None = None) -> KSDetectionResult:
-        threshold = self.threshold_for(slice_type)
+        self.threshold_for(slice_type)  # raises if uncalibrated
         stat = self.statistic(observed_gaps, baseline_gaps)
-        return KSDetectionResult(statistic=stat, anomaly=stat > threshold)
+        return KSDetectionResult(statistic=stat,
+                                 anomaly=self._exceeds(stat, len(observed_gaps), len(baseline_gaps), slice_type))
 
     def anomaly_by_slice(
         self,

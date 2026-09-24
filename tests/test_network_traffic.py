@@ -102,3 +102,37 @@ class SendTrafficPlanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- steady_jitter_frac (added 2026-09-24) ---------------------------------
+import hashlib as _hashlib
+
+import numpy as _np
+
+from network_covert_channel.traffic import generate_inter_packet_gaps as _gen
+
+# SHA-256 of generate_inter_packet_gaps(slice, 1000, default_rng(2026)) recorded
+# BEFORE the steady_jitter_frac parameter was added: the default must not change output.
+_PRE_EDIT_HASHES = {
+    "URLLC": "e37855b61dc910af395ff0e2af03fe860e318ec43d84b7abce693a492e0ec340",
+    "eMBB": "d61e45305cc5a07328b92b205326466cc8c11ebd61227d5b5fe93e981e60821f",
+    "mMTC": "7fb25b8698dc67fb29b930af26bcd5159b9b551618793272f3c30540528c9732",
+}
+
+
+def test_default_steady_jitter_reproduces_pre_edit_output_bit_for_bit():
+    for s, h in _PRE_EDIT_HASHES.items():
+        assert _hashlib.sha256(_gen(s, 1000, _np.random.default_rng(2026)).tobytes()).hexdigest() == h
+        assert _hashlib.sha256(_gen(s, 1000, _np.random.default_rng(2026), steady_jitter_frac=0.05).tobytes()).hexdigest() == h
+
+
+def test_larger_steady_jitter_widens_urllc_spread():
+    narrow = _gen("URLLC", 20000, _np.random.default_rng(1), steady_jitter_frac=0.05)
+    wide = _gen("URLLC", 20000, _np.random.default_rng(1), steady_jitter_frac=0.5)
+    assert wide.std() > narrow.std()
+
+
+def test_negative_steady_jitter_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        _gen("URLLC", 10, _np.random.default_rng(0), steady_jitter_frac=-0.1)
