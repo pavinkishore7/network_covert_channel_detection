@@ -263,6 +263,32 @@ actual run of `covert_demo.plot_clean_vs_covert` against real synthetic
 gap arrays at the 4ms offset (not mocked or fabricated):
 `results/network_covert_channel_phase2_gap_distributions.png`.
 
+### Where detection breaks down (`sweep_extended.py`, `results/phase2_sweep_extended.csv`)
+
+The 500-trial sweep above saturates at its smallest offset (0.1σ). `python -m network_covert_channel.sweep_extended` (seed 2026, 500 windows of 300 packets per point, about 80 s) extends it.
+
+**(i) Breakdown at the default traffic model** (steady jitter 5%):
+- Detection first reaches ≥ 90% at **0.1σ for URLLC** (1.02 ms delay; 0.84 at 0.05σ) and **0.1σ for eMBB** (2.57 ms; 0.75 at 0.05σ). mMTC reaches it at **0.05σ** (2.05 ms; 0.39 at 0.02σ).
+- At ≤ 0.01σ, detection on every slice is at the false-alarm level, so the channel is undetectable there.
+- The adaptive injector tracks the non-adaptive one within about 10 points at every offset (largest gap: eMBB at 0.05σ, 0.65 vs 0.75).
+
+**(ii) Dependence on traffic regularity.** Same absolute delays; the detector is recalibrated on clean traffic at each jitter.
+- **URLLC:** doubling the steady jitter from 5% to 10% drops detection of a 1.02 ms (0.1σ) delay from 1.00 to 0.17. At 20% and 50% it is at chance.
+- **eMBB at 0.1σ:** 1.00 → 0.87 → 0.96 → 0.02 for 5 / 10 / 20 / 50% jitter.
+- **mMTC** holds up longest: at 0.1σ it is still 1.00 at 50% jitter, and at 0.05σ it drops to 0.57.
+
+**(iii) Caveat.** Detectability follows the delay relative to the width of the *steady* core of the gap distribution (column `offset_over_steady_sd`), not relative to the overall σ, which the bursty tail inflates. The simulated steady traffic is very regular (5% jitter), so the default-setting detection rates reflect that regularity. With noisier real traffic, a timing channel of the same size would be harder to detect.
+
+**(iv) Detector design limitation.** Each window is compared with **one fixed baseline window**, so the results depend on that single draw. This explains two things in the extended sweep:
+- the non-monotone eMBB result (0.87 at 10% jitter, 0.96 at 20%);
+- a measured false-alarm rate between 0.2% and 8.8% across settings, against a nominal 5%.
+
+A pooled reference built from many clean windows would remove this. That is not done here.
+
+**(v) The adaptive injector remains weak.** Its perturbation is 93–94% of the non-adaptive one. These results say nothing about a genuinely adaptive timing attacker.
+
+Figure: `results/report/fig_net_detection_vs_offset.png`.
+
 ### Limits
 
 - **KS tests only the marginal gap distribution.** This injector adds a
