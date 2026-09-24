@@ -75,12 +75,150 @@ The audit log records the signed payload and the expected challenge, so
 For `challenge_mismatch` records it deliberately does not assert
 "crypto valid ⇒ trusted"; see its docstring.
 
-`ReauthServer` handles connections concurrently: one thread each, capped,
-with a per-connection read timeout. It size-caps and fully validates
-every request, so malformed input gets an error reply or a closed
-connection instead of killing the server. The controller's scheduling
-decision is made under a lock, so concurrent requests for one slice fire
-at most once.
+`ReauthServer` handles connections concurrently: one thread each, with a
+per-connection read timeout. A new connection is closed at once if its
+source IP already has 4 open (`max_connections_per_peer`), or if 32 are
+open in total. The server size-caps and fully validates every request,
+so malformed input gets an error reply or a closed connection instead of
+killing the server. The controller's scheduling decision is made under a
+lock, so concurrent requests for one slice fire at most once.
+
+**Every answer is signed, not only "re-auth performed".** The server
+signs every response to a request that carries a usable challenge, over
+the same canonical payload (`status` is `due`, `not_due` or `error`,
+bound to `client_challenge`). Before this, "not due" and refusals were
+unsigned. An on-path attacker could answer every PERIODIC request with a
+forged "not due" and silently switch periodic re-authentication off: the
+client could not tell, and nothing reached the audit log as a failure.
+That would have made the periodic half of the dual trigger
+attacker-controllable.
+
+Now an unsigned "not due" is `REJECTED_UNSIGNED_STATUS`. A badly signed
+one is `REJECTED_SIGNATURE`, and a replayed one is
+`REJECTED_CHALLENGE_MISMATCH`. All three are authentication failures, so
+the policy alerts and escalates and never retries them.
+
+**The resulting property:** an on-path attacker can no longer *forge* any
+answer. It can only *drop* traffic, and dropping surfaces as `TIMEOUT` /
+`CONNECTION_FAILED`, which the failure policy alerts on. Suppressing
+re-authentication goes from silent to detected. It is still **not
+prevented**: an attacker in the path can keep dropping for as long as it
+stays there.
+
+Only requests with no usable challenge (garbage, oversized, truncated,
+wrong version) get an unsigned refusal. No legitimate client sends those,
+and signing them would just let junk traffic make the server sign.
+
+**Per-IP limit.** The limit is per source IP, on TCP. It stops a single
+peer, including an off-path one, since TCP needs a completed handshake and
+a spoofed address can't complete one. It does **not** stop an attacker who
+controls many addresses.
+
+### Failure handling: outcomes and policy
+
+Every request ends in exactly one `RequestOutcome` (`pqc_auth/outcomes.py`).
+The retry logic and the policy act on its category:
+
+| category | outcomes | retried? | default policy |
+|---|---|---|---|
+| OK | `VERIFIED`, `NOT_DUE` | – | none; clears a quarantine |
+| AUTH_FAILURE | `REJECTED_SIGNATURE`, `REJECTED_REPLAY`, `REJECTED_CHALLENGE_MISMATCH`, `REJECTED_PINNED_KEY`, `REJECTED_TOFU_KEY_CHANGED`, `REJECTED_UNSIGNED_STATUS`, `MALFORMED_RESPONSE` | **never** | ALERT + ESCALATE at once; 2 in 300 s → QUARANTINE |
+| TRANSPORT_FAILURE | `TIMEOUT`, `CONNECTION_FAILED` | yes, ≤ 3 attempts | 3 consecutive attempts → ALERT; QUARANTINE only if the slice is fail-closed (6 consecutive) |
+| REFUSED | `SERVER_REFUSED` (an authenticated refusal) | never | ALERT |
+
+**Retries (`ReauthClient`):**
+
+- Timeouts: connect 3.0 s, and a read deadline of 5.0 s for the whole
+  response. The reasons are in the class docstring.
+- Up to 3 attempts, with full-jitter exponential backoff (0.25 s base,
+  2 s cap).
+- Every attempt uses a **new connection and a fresh challenge**. A reused
+  challenge would let a delayed or captured answer to an earlier attempt
+  pass as the answer to the retry.
+- Every attempt is audit-logged with its outcome and attempt number.
+- An authentication failure is never retried. A forged response is a
+  security event, not a flaky network: retrying would hide it and give an
+  attacker more tries.
+
+**Policy (`failure_policy.decide()`)** is a pure function of slice type,
+outcome history and time. The thresholds are design choices, justified in
+its docstring, not measured.
+
+| trigger | action |
+|---|---|
+| any AUTH_FAILURE | `ESCALATE_TO_DETECTOR_ALERT`: alert, plus one extra re-auth via the existing detector-alert path |
+| 2nd AUTH_FAILURE within 300 s | `QUARANTINE_FLAG`: slice untrusted until an authenticated answer |
+| 3 consecutive TRANSPORT_FAILURE attempts | `ALERT` |
+| 6 consecutive TRANSPORT_FAILURE attempts on a **fail-closed** slice | `QUARANTINE_FLAG` |
+| REFUSED | `ALERT` |
+| authenticated answer while quarantined | `NONE`, logged as `quarantine_cleared` |
+
+`ReauthSupervisor` applies the decisions, and `live_loop.py` uses it. It
+writes each decision to the audit log together with the seqs of the
+outcome records that justify it. `audit_verify` re-derives every
+QUARANTINE from those cited records.
+
+**Storm guard.** A failure → forced re-auth → failure cycle is bounded
+three ways:
+
+- Only transport failures are retried, at most 3 times.
+- Transport failures never escalate.
+- Escalation has a 30 s per-slice cooldown, which is 3× the controller's
+  10 s alert cooldown. A failed escalation is downgraded to a plain alert.
+
+A sustained attack therefore costs at most one extra re-auth per slice
+per 30 s.
+
+**Fail-open vs fail-closed** (per slice, `SliceFailurePolicy.fail_closed`).
+**The default is fail-open on every slice.**
+
+- **Fail-closed:** a drop-only attacker can push the slice into
+  QUARANTINE. That is an attacker-induced outage, and on URLLC it hits
+  exactly the traffic that can least afford one.
+- **Fail-open:** the slice keeps running on its last verified session
+  while re-auth fails. That session is unverified for the length of the
+  outage; it is flagged by an ALERT for every exhausted request, but not
+  stopped.
+
+Fail-open is the default because it gives a drop-only attacker nothing
+new: dropping is already alerted on, and the last session was
+authenticated. Fail-closed would hand that attacker a kill switch.
+
+An attacker who can *inject* rather than only drop can manufacture
+authentication failures without any key, since any garbage signature
+will do. It can therefore reach QUARANTINE on any slice. That is
+intended: an active forger in the path is exactly when a session should
+stop being trusted, and it shows up as authentication failures in the
+audit log, not as a quiet outage.
+
+**The dual trigger is intact.** Nothing in the policy touches the
+controller's PERIODIC schedule. Escalation only *adds* detector-alert
+re-auths, and a quarantined slice is still re-authenticated on schedule;
+that is how it leaves quarantine.
+`tests/test_failure_policy.py::DualTriggerIntactTests` checks this.
+
+**Transport confidentiality is an explicit non-goal.**
+
+- **Nothing secret is carried.** Re-auth messages carry a nonce, a
+  challenge, a public key and a signature. None of them is secret, so
+  there is nothing for encryption to protect.
+- **The threat model is forgery and replay.** Both are handled by the
+  signature and the challenge binding.
+- **Dropping is handled, not ignored.** An observer who drops traffic
+  now shows up as `TIMEOUT` / `CONNECTION_FAILED` and is handled by the
+  policy.
+- **What TLS would add:** hiding *that* re-auth is happening and *when*.
+  Traffic-analysis resistance is not something this project claims.
+
+**Measured signing cost.** Server-side ML-DSA-65 via liboqs, each call
+timed with `time.perf_counter()`. Median of N=75 signed responses on a
+12th Gen Intel Core i5-1235U (12 logical CPUs) under WSL2 (kernel
+6.6.87.2-microsoft-standard-WSL2), Python 3.12.3, liboqs 0.16.0:
+
+- sign: 0.40 ms (p95 0.92 ms)
+- verify: 0.13 ms (p95 0.24 ms)
+
+The run and its caveats are in `integration/README.md`.
 
 **Public-key pinning.** `ReauthClient(..., expected_public_key=...)` pins
 the client to one specific identity. In `process_response()`, if the
@@ -303,7 +441,7 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   *manually* accept a new key for an already-known `server_id`, but there
   is no automatic distinction between a legitimate rotation and an
   attacker's key, and no revocation mechanism of any kind.
-- **The transport defaults to localhost, and has now been run across the
+- **The transport defaults to localhost, and has been run across the
   real namespace topology**, with server and clients as separate processes
   in separate namespaces, via `python -m pqc_auth.transport serve|request`
   (see `main()` in `transport.py`) and `integration/auth_over_topology.py`.
@@ -311,23 +449,21 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   outcomes before and after the challenge binding, idle and malformed
   attacker connections, what a client does when the link dies, measured
   sign/verify time, and latency caveats.
-- **Connection handling is still minimal on the client.** The client has no
-  retries or reconnection logic, and only a flat per-call socket timeout.
-- **No transport-layer security beyond the signature itself.** Requests are
-  not authenticated, and a `{"due": false}` answer is not signed. A
-  network-level attacker can still see traffic, drop it, or make a re-auth
-  look "not due". It cannot forge a response or replay one.
-- **Connection cap exhaustion.** The server's connection cap bounds what one
-  attacker can hold. An attacker that fills every slot still locks everyone
-  out until those connections time out, because there is no per-peer limit.
+- **No transport-layer security beyond the signature itself, by design**
+  (see "Transport confidentiality is an explicit non-goal" above).
+  Requests are not authenticated. An on-path attacker can see traffic and
+  drop it, and dropping is detected but not preventable.
+- **The per-IP connection limit does not stop an attacker with many
+  addresses.** With the defaults, 8 addresses holding 4 connections each
+  fill all 32 slots until those connections time out.
 - **No real-time integration with a running detector process** (this was
   already true of `orchestration.py` before this round of work, and still
   is): `drive_reauth_from_detector_flags()` takes anomaly flags you've
   already computed; it doesn't poll or subscribe to a detector.
-- **No handling of what a client does after a rejection.** `ReauthClient`
-  correctly reports `trusted=False` or `rejected_as_replay=True`, but there
-  is no retry policy, alerting, or lockout behavior built on top of that
-  result yet — that decision is left to the caller.
+- **QUARANTINE is a flag, not an enforcement point.** `ReauthSupervisor`
+  records and reports it, and the audit log proves why it was set.
+  Nothing in this project blocks a quarantined slice's traffic; that
+  enforcement belongs to whatever consumes the flag.
 - **No key-distribution or certificate infrastructure behind pinning.**
   `expected_public_key` only compares bytes the caller already has; it does
   not obtain them, verify a certificate chain, handle first-contact trust,

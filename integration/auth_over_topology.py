@@ -164,7 +164,9 @@ class AuthTopologyConfig:
     replay_port: int = 7001
     server_id: str = "core-reauth"
     rtt_samples: int = 10  # requests per (slice, trust mode) batch
-    client_timeout: float = 5.0  # passed to ReauthClient; its own default, unchanged
+    # None = use ReauthClient's own defaults (connect 3.0 s, read 5.0 s, 3 attempts; see its docstring)
+    client_connect_timeout: float | None = None
+    client_read_timeout: float | None = None
     hang_timeout_s: float = 90.0  # orchestrator-side kill: beyond this a client counts as HUNG
     ready_timeout_s: float = 30.0
     link_fault_slice: str = "URLLC"
@@ -173,7 +175,7 @@ class AuthTopologyConfig:
     link_fault_span: int = 2  # ... and removed after this many more
     link_fault_interval: float = 0.5
     server_connection_timeout: float = 10.0  # ReauthServer drops a silent connection after this
-    idle_attack_connections: int = 8  # fewer than ReauthServer's default cap (32) -- see README
+    idle_attack_connections: int = 40  # MORE than ReauthServer's global cap (32): the per-peer limit (4) must hold
     idle_attack_hold_s: float = 15.0  # > server_connection_timeout, so the server's drop is observed
     t0: float = 1_000_000.0  # logical clock for request `now` values
     now_step: float = 1000.0  # > every DEFAULT_POLICIES interval, so each request is due
@@ -268,7 +270,8 @@ def build_client_cmd(
         cfg.python, "-m", "pqc_auth.transport", "request",
         "--server", server, "--port", str(port), "--slice-type", slice_type, *trust,
         "--audit-log", str(cfg.client_audit_log),
-        "--timeout", str(cfg.client_timeout),
+        *(["--connect-timeout", repr(cfg.client_connect_timeout)] if cfg.client_connect_timeout is not None else []),
+        *(["--read-timeout", repr(cfg.client_read_timeout)] if cfg.client_read_timeout is not None else []),
         "--now", repr(float(now)), "--now-step", repr(float(now_step)),
         "--count", str(count), "--interval", repr(float(interval)),
     ]
@@ -692,6 +695,7 @@ class AuthOverTopologyRunner:
         path = Path(step.meta["served_log"])
         records = [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
         self.report["server"] = summarize_served_log(records)
+        self.report["machine"] = machine_context()
 
     def _step_audit(self, step: Step) -> None:
         result = self._run(list(step.argv), timeout=self.cfg.hang_timeout_s)
@@ -727,13 +731,23 @@ class AuthOverTopologyRunner:
 def _describe_request(r: dict) -> str:
     phase = f"[{r['phase']}] " if "phase" in r else ""
     head = f"{phase}#{r.get('index')} {r.get('slice_type')} -> {r.get('target')}"
+    attempts = r.get("attempts") or []
+    tries = "".join(f"\n          attempt {a['attempt']}: {a['outcome']} after {a['elapsed_ms']:.0f} ms"
+                    + (f" ({a['detail']})" if a.get("detail") else "") for a in attempts) if len(attempts) > 1 else ""
+    policy = r.get("policy") or {}
+    pol = ""
+    if policy.get("action") not in (None, "none") or policy.get("rule") == "quarantine_cleared":
+        pol = f"\n          POLICY {policy['action'].upper()} ({policy['rule']}): {policy['reason']}"
+    esc = r.get("escalation")
+    if esc:
+        pol += f"\n          escalation (detector_alert re-auth) -> {esc['outcome']}, policy {esc['policy']['action']}"
     if r.get("error"):
-        return f"{head}: EXCEPTION {r['error']['type']}: {r['error']['message']} (after {r['elapsed_ms']:.0f} ms)"
+        return (f"{head}: {r['error']['type'].upper()} after {len(attempts)} attempt(s), "
+                f"{r.get('elapsed_ms', 0):.0f} ms total{tries}{pol}")
     res = r["result"]
-    flags = [k for k in ("challenge_mismatch", "rejected_as_replay", "pinned_key_mismatch", "trust_store_key_changed",
-                         "malformed_response") if res.get(k)]
-    verdict = "TRUSTED" if res.get("trusted") else ("not due" if not res.get("due") else "REJECTED")
-    return f"{head}: {verdict}{' (' + ', '.join(flags) + ')' if flags else ''} rtt={r['rtt_ms']:.2f} ms"
+    outcome = r.get("outcome") or ("verified" if res.get("trusted") else "rejected")
+    verdict = {"verified": "TRUSTED", "not_due": "NOT DUE (signed)"}.get(outcome, f"REJECTED ({outcome})")
+    return f"{head}: {verdict} rtt={r['rtt_ms']:.2f} ms{tries}{pol}"
 
 
 def summarize_rtts(report: dict) -> dict[str, dict[str, float]]:
@@ -763,11 +777,43 @@ def _stats(values: Sequence[float]) -> dict[str, float] | None:
             "p95_ms": p95, "max_ms": ordered[-1]}
 
 
+def machine_context() -> dict[str, Any]:
+    """Where the timing numbers came from, so they can be quoted as
+    "median of N on <machine>"."""
+    import platform
+
+    cpu = None
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    liboqs = None
+    try:
+        import oqs  # type: ignore[import-not-found]
+
+        liboqs = f"liboqs {oqs.oqs_version()} / liboqs-python {oqs.oqs_python_version()}"
+    except Exception:  # noqa: BLE001 - informational only
+        pass
+    return {
+        "cpu": cpu,
+        "logical_cpus": os.cpu_count(),
+        "kernel": platform.release(),
+        "python": platform.python_version(),
+        "liboqs": liboqs,
+    }
+
+
 def summarize_served_log(records: Sequence[dict]) -> dict[str, Any]:
-    """Server-side sign/verify time as measured inside controller.reauth()
-    (time.perf_counter around signer.sign and signer.verify), plus a tally
+    """Server-side sign/verify time, measured with time.perf_counter around
+    signer.sign and signer.verify (inside controller.reauth() for a "due"
+    answer, in ReauthServer._sign for a "not due" one), plus a tally
     of every non-served event by code."""
-    due = [r for r in records if r.get("event") == "served" and r.get("due")]
+    # Every served answer is signed now ("re-auth performed" AND "not due"),
+    # so sign time covers both; only a "due" answer is also self-verified.
+    due = [r for r in records if r.get("event") == "served"]
     events: dict[str, int] = {}
     for r in records:
         key = r.get("event", "?") if r.get("event") != "error" else f"error:{r.get('code')}"
@@ -811,6 +857,10 @@ def format_summary(report: dict) -> str:
         if probe.get("server_alive_after") is not None:
             lines.append(f"      server process still running afterwards: {probe['server_alive_after']}")
     server = report.get("server") or {}
+    machine = report.get("machine") or {}
+    if machine:
+        lines.append(f"machine: {machine.get('cpu')} ({machine.get('logical_cpus')} logical CPUs), kernel "
+                     f"{machine.get('kernel')}, Python {machine.get('python')}, {machine.get('liboqs')}")
     for key in ("sign_ms", "verify_ms"):
         s = server.get(key)
         if s:
@@ -927,7 +977,13 @@ def run_malformed_probe(server: str, port: int) -> int:
                     chunks.append(chunk)
             raw = b"".join(chunks)
             try:
-                reply = json.loads(raw).get("error") if raw else "connection closed, no reply"
+                parsed = json.loads(raw) if raw else None
+                if parsed is None:
+                    reply = "connection closed, no reply"
+                elif "payload" in parsed:  # a refusal bound to a usable challenge is signed
+                    reply = f"{json.loads(parsed['payload'])['error_code']} (signed)"
+                else:
+                    reply = f"{parsed.get('error')} (unsigned: no usable challenge in the request)"
             except ValueError:
                 reply = repr(raw[:80])
         except OSError as exc:

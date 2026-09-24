@@ -87,7 +87,7 @@ as in the current run below. The replay results were not:
   transport-hardening branch fixed it (wire version 2, see
   `pqc_auth/transport.py`).
 
-### Current run: wire version 2 (the transport-hardening branch)
+### Second run: wire version 2 (the transport-hardening branch)
 
 - **Legit batches:** 60/60 trusted (10 per slice per mode). Every TOFU store
   learned exactly the out-of-band key.
@@ -146,28 +146,91 @@ as in the current run below. The replay results were not:
   remained, and no `pqc_auth.transport` or orchestrator processes were left.
   The integration test (`-m integration`) also passed in the same setup.
 
+### Current run: signed status answers, per-IP limit, failure policy (the auth-failure-policy branch)
+
+Same topology and user-namespace setup, same plan, with these changes:
+
+- **Legit batches:** 60/60 trusted, and every TOFU store matched the
+  out-of-band key.
+- **Replay, same process and fresh process:** both
+  `REJECTED (rejected_challenge_mismatch)`, as in the second run. The
+  failure policy now acts on them. Each rejection → `ESCALATE_TO_DETECTOR_ALERT`,
+  then one detector-alert re-auth, which reached the same replaying
+  endpoint and was rejected again → `QUARANTINE_FLAG` (2 authentication
+  failures in 300 s, further escalation suppressed by the cooldown).
+- **Rogue server:** the rejection paths are unchanged (`rejected_pinned_key`
+  and `rejected_tofu_key_changed`), and each now gets the same
+  escalate-then-quarantine treatment.
+- **Idle attacker, 40 connections from ns-rogue.** That is more than the
+  server's global cap of 32.
+  - The per-IP limit (4) held.
+  - Exactly 4 connections were kept open until the server's 10 s read
+    timeout (4 `read_timeout` events).
+  - The other 36 were closed by the server on accept (36
+    `rejected_per_peer_limit`, 0 `rejected_at_capacity`). The attacker
+    saw those closes at its first poll, t≈1.02 s after it started, i.e.
+    once it had finished opening all 40.
+  - URLLC, eMBB and mMTC were each served and trusted from t=+0.00 s to
+    t=+3.13 s after the attacker's READY.
+  - Without the per-IP limit, 40 connections from one address would have
+    filled all 32 slots.
+- **Malformed probe:** the server survived, and each slice was served
+  afterwards. The two refusals whose request still carried a usable
+  challenge are now **signed**: `unknown_slice_type (signed)` and
+  `invalid_now (signed)`. The rest are unsigned by design, since there is
+  no challenge to bind them to.
+- **Link failure, blackhole (100% loss both ways).** Each faulted request
+  made **3 attempts**, each `timeout after 3004 ms`, which is the new 3.0 s
+  connect timeout. The attempts were separated by jittered backoff, and
+  each used a fresh connection and challenge. Then
+  `POLICY ALERT (transport_failures_to_alert): 3 consecutive transport failures
+  (threshold 3; fail-open: continuing on the last verified session)`.
+  The second faulted request reported 6 consecutive failures. The client
+  recovered on the first request after the fault was removed. Nothing was
+  quarantined, because the slice is fail-open.
+- **Link failure, link down.** Each faulted request made 3 attempts, each
+  `connection_failed` with `OSError: [Errno 101] Network is unreachable`
+  within ~1 ms, then the same ALERT, then recovery.
+- **Audit:** `audit_verify` on the client log gave **107 records checked,
+  0 failures, OVERALL: PASS**. Those records include every retry attempt
+  (as `transport_failure` records) and every policy decision (each citing
+  its evidence).
+- **Integration test and leak check:** the integration test passed. On
+  the host afterwards there were no namespaces, no bridge or veth, and no
+  leftover processes.
+
 ### Latency: what these numbers are and are not
 
-**Server-side signing cost, measured directly.** `DualTriggerReauthController.reauth()`
-brackets `signer.sign()` and `signer.verify()` with `time.perf_counter()`
-and the server logs both. ML-DSA-65 (liboqs), 75 due responses in this run:
+**Server-side signing cost, measured directly.** `time.perf_counter()`
+brackets each `signer.sign()` and `signer.verify()`: inside
+`DualTriggerReauthController.reauth()` for a "re-auth performed" answer,
+and in `ReauthServer._sign` for a "not due" one. The server logs both.
 
-| operation | min      | median   | p95      | max      |
-|-----------|----------|----------|----------|----------|
-| sign      | 0.187 ms | 0.471 ms | 0.942 ms | 1.722 ms |
-| verify    | 0.067 ms | 0.166 ms | 0.263 ms | 0.360 ms |
+- **Algorithm:** ML-DSA-65 via liboqs 0.16.0 / liboqs-python 0.16.0.
+- **Machine:** 12th Gen Intel Core i5-1235U (12 logical CPUs), WSL2
+  kernel 6.6.87.2-microsoft-standard-WSL2, Python 3.12.3, inside the
+  rootless user namespace.
+- **Sample:** N = 75 signed responses in the current run.
 
-The client's verify is the same operation, but it is not separately timed.
+| operation | N  | min      | median   | p95      | max      |
+|-----------|----|----------|----------|----------|----------|
+| sign      | 75 | 0.145 ms | 0.398 ms | 0.916 ms | 1.365 ms |
+| verify    | 75 | 0.060 ms | 0.131 ms | 0.236 ms | 0.345 ms |
 
-**RTT per request**, measured by the client process from connect to verified
-result (TCP connect + request + server sign + response + client verify).
-liboqs is imported before timing starts. Legit batches only:
+Quote these as, e.g., "ML-DSA-65 sign: median 0.40 ms (N=75) on an Intel
+i5-1235U under WSL2". The second run measured median sign 0.47 ms and
+verify 0.17 ms, also with N=75, on the same machine. The client's own
+verify is the same operation but is not separately timed.
 
-| slice | n  | min      | median   | p95      | max       |
-|-------|----|----------|----------|----------|-----------|
-| URLLC | 20 | 10.36 ms | 11.84 ms | 13.24 ms | 16.03 ms  |
-| eMBB  | 20 | 19.01 ms | 22.18 ms | 43.88 ms | 450.93 ms |
-| mMTC  | 20 | 27.95 ms | 32.69 ms | 50.70 ms | 256.73 ms |
+**RTT per request**, current run, legit batches only. Measured by the
+client process from connect to verified result, for the attempt that got
+the answer. liboqs is imported before timing starts.
+
+| slice | n  | min      | median   | p95      | max      |
+|-------|----|----------|----------|----------|----------|
+| URLLC | 20 | 8.87 ms  | 10.72 ms | 12.77 ms | 14.89 ms |
+| eMBB  | 20 | 19.02 ms | 21.43 ms | 30.54 ms | 42.34 ms |
+| mMTC  | 20 | 28.55 ms | 32.59 ms | 47.21 ms | 63.34 ms |
 
 **This is veth-in-a-VM latency: signature + transport overhead on a software
 topology.** It is not radio latency, not 5G latency, and it must **not** be
@@ -181,71 +244,57 @@ response. Signing and verifying are measured above at under 1 ms at the
 median. The rest is Python, process and TCP overhead on this machine, and
 it is not broken down further.
 
-The long tails (e.g. eMBB 450 ms, mMTC 257 ms here; one mMTC request took
-1090 ms in the version-1 run) are consistent with TCP retransmission timers
-under each slice's configured netem loss (0.75% eMBB, 1.2% mMTC). That
-explanation is inferred, not captured.
+Earlier runs had long tails: 1090 ms (mMTC) in the first run, 451 ms
+(eMBB) in the second. They are consistent with TCP retransmission timers
+under each slice's configured netem loss. That explanation is inferred,
+not captured.
 
-## Transport behaviour now (wire version 2)
+## Transport behaviour now
 
-**Wire format.** Requests carry `v: 2` and a 32-byte `client_challenge`. A
-due response carries `payload`, the exact canonical-JSON string that was
-signed, containing:
+**Wire format (version 2).**
 
-- `v`
-- `server_id`
-- `slice_type`
-- `reason`
-- `client_challenge`
-- `server_nonce`
-- `request_now`
-- `issued_at`
+- Requests carry `v: 2` and a 32-byte `client_challenge`.
+- **Every** answer to a request with a usable challenge is signed. That
+  covers `status` `due`, `not_due` and `error`.
+- The signature covers `b"pqc_auth.reauth.v2\x00" + payload`.
+- The payload keys are the same for every status: `v`, `status`,
+  `server_id`, `slice_type`, `reason`, `error_code`, `client_challenge`,
+  `server_nonce`, `request_now`, `issued_at`.
+- Only requests with no usable challenge get an unsigned refusal.
+- There is no v1 compatibility path.
 
-The signature covers `b"pqc_auth.reauth.v2\x00" + payload`. Version-1
-requests are refused (`unsupported_version`) and version-1 responses are
-rejected (`malformed_response`). There is no compatibility path.
+**Client.**
 
-**Client check order:**
+- Connect timeout 3.0 s, and a whole-response read deadline of 5.0 s.
+- Up to 3 attempts, for transport failures only.
+- Full-jitter backoff, with a fresh connection and a fresh challenge on
+  every attempt.
+- Every attempt is audit-logged.
+- Checks, in order: structure, pin, TOFU key, **challenge**, seen nonce,
+  signature.
+- Every request ends in one `RequestOutcome`, and none of them raises. See
+  pqc_auth/README.md for the outcome and policy tables.
 
-1. Structure/version
-2. Explicit pin
-3. TOFU key
-4. **Challenge** (constant-time compare)
-5. Seen server nonce (defence in depth only)
-6. Signature
+**Server.**
 
-**Server:**
+- One thread per connection.
+- 4 concurrent connections per source IP and 32 in total. Beyond either
+  cap, a connection is closed at once and logged.
+- Per-connection read timeout, 1024-byte request cap, full validation.
+- The controller's scheduling decision runs under a lock.
+- `SERVER_THREAD_DIED` (CLI) fires only if the accept loop itself dies.
 
-- **Connections:** one thread per connection, capped at 32 by default.
-  Beyond the cap, a new connection is closed at once and logged as
-  `rejected_at_capacity`.
-- **Timeouts:** each connection has a read timeout (5 s by default).
-- **Scheduling:** the controller's scheduling decision is made under a lock,
-  so two simultaneous requests for one slice fire once.
-- **Request limits:** requests are capped at 1024 bytes and fully validated
-  before use.
-- **`SERVER_THREAD_DIED` (CLI):** now fires only if the accept loop itself
-  dies while the server should be running, e.g. `accept()` failing with
-  EMFILE, or a bug in that loop. Per-connection work cannot reach it.
+**Still not addressed.**
 
-**Client failure modes** (still no retries):
-
-- Connection refused → `ConnectionRefusedError`
-- Peer closes before sending anything → `ConnectionError`
-- Peer closes mid-line → `TruncatedMessage` (a `ConnectionError`)
-- Response over 64 KB → `MessageTooLarge`
-- Silence → `TimeoutError`
-- Server refusal → `ReauthRequestError(code)`
-
-**Still not addressed:**
-
-- **Cap exhaustion:** an attacker holding **all** connection slots (32 by
-  default) gets every further connection closed immediately, legitimate
-  clients included, for up to the read timeout per held connection. There
-  is no per-peer limit.
-- **Unauthenticated requests and unsigned "not due" answers:** an on-path
-  attacker can still suppress a re-auth by answering `{"due": false}`, or
-  can drop traffic. It can no longer make a client accept a stale response.
+- **Many addresses:** the per-IP limit is per IP on TCP. An attacker with
+  8 or more addresses can still fill every slot, for up to the read
+  timeout per held connection.
+- **Unauthenticated requests:** requests are not authenticated. An on-path
+  attacker can still drop traffic. That is now *detected* (TIMEOUT /
+  CONNECTION_FAILED → ALERT), but it is not *prevented*.
 - **Server state on a client timeout:** a client that times out may have
-  had its request processed, and its schedule state committed, by the
-  server. The client never sees the result.
+  had its request processed, and schedule state committed, by the server.
+  With retries, the next attempt would then get a signed "not due" (the
+  server already fired), which is authenticated and ends the request
+  normally. That follows from the code; it was not observed in these
+  runs.

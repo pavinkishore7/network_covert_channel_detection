@@ -213,7 +213,7 @@ class PlanTests(unittest.TestCase):
         attacker = self.plan[start].argv
         self.assertEqual(attacker[:4], ("ip", "netns", "exec", ROGUE.netns))
         self.assertEqual(_arg(attacker, "--server"), CORE.ip(self.topo))
-        self.assertLess(self.cfg.idle_attack_connections, 32)  # below ReauthServer's default cap
+        self.assertGreater(self.cfg.idle_attack_connections, 32)  # beyond the global cap: per-peer limit must hold
         self.assertGreater(self.cfg.idle_attack_hold_s, self.cfg.server_connection_timeout)
         core = next(s for s in self.plan if s.kind == "start" and s.meta["proc"] == "core")
         self.assertEqual(float(_arg(core.argv, "--connection-timeout")), self.cfg.server_connection_timeout)

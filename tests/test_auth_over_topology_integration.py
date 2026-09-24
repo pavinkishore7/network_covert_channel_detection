@@ -82,7 +82,10 @@ class AuthOverTopologyLiveTest(unittest.TestCase):
             self.assertLess(client["wall_end"] - ready, cfg.server_connection_timeout)
         idle_done = next(p for p in report["probes"] if "idle" in p["name"])["records"][-1]
         self.assertEqual(idle_done["closed_by_server"], cfg.idle_attack_connections)
-        self.assertTrue(all(t >= cfg.server_connection_timeout for t in idle_done["closed_after_s"]))
+        held = [t for t in idle_done["closed_after_s"] if t >= cfg.server_connection_timeout]
+        self.assertEqual(len(held), 4)  # ReauthServer's per-peer limit: ns-rogue is one address
+        self.assertEqual(report["server"]["events"].get("rejected_per_peer_limit"), cfg.idle_attack_connections - 4)
+        self.assertNotIn("rejected_at_capacity", report["server"]["events"])
 
         malformed = next(p for p in report["probes"] if p["name"].startswith("malformed"))
         self.assertTrue(malformed["server_alive_after"])
@@ -91,6 +94,7 @@ class AuthOverTopologyLiveTest(unittest.TestCase):
             self.assertTrue(client["requests"][0]["result"]["trusted"], client)
         self.assertNotIn("error:internal_error", report["server"]["events"])
         self.assertGreater(report["server"]["sign_ms"]["n"], 0)
+        self.assertIn("cpu", report["machine"])
 
         rogue = {c["trust_mode"]: c["requests"][0]["result"] for c in report["clients"] if c["group"] == "rogue"}
         self.assertFalse(rogue["pinned"]["trusted"])
@@ -107,6 +111,11 @@ class AuthOverTopologyLiveTest(unittest.TestCase):
             for r in client["requests"]:
                 if r["phase"] != "during_fault":
                     self.assertTrue(r["result"]["trusted"], (client["name"], r))
+                else:
+                    # retried as transport failures, never as crypto, then alerted
+                    self.assertEqual(r["category"], "transport_failure", r)
+                    self.assertEqual(len(r["attempts"]), 3, r)
+                    self.assertEqual(r["policy"]["action"], "alert", r)
 
         self.assertEqual(report["audit"]["exit_code"], 0, report["audit"])
         self.assertEqual(report["teardown"]["leaked_netns"], [])

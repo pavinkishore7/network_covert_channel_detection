@@ -36,7 +36,21 @@ What this actually does:
      Every such attempt is logged to the same ``pqc_auth.audit_log.AuditLogger``
      JSONL mechanism used elsewhere in this project. See ``run_live_loop()``
      for the full reasoning.
-  4. At the end, runs ``pqc_auth.audit_verify`` against the resulting log
+  4. Every real fire goes through ``pqc_auth.failure_policy.ReauthSupervisor``:
+     the request's outcome (every attempt) is fed to the pure
+     ``failure_policy.decide()``, and its action is APPLIED -- ALERTs are
+     printed and recorded, QUARANTINE flags the slice until an authenticated
+     answer, ESCALATE sends one extra detector-alert re-auth (cooldown-
+     limited), and every non-trivial decision is written to the same audit
+     log with the seqs of the outcome records that justify it. The
+     periodic schedule is never touched by any of this: the loop keeps
+     asking the controller "would this fire" every tick, quarantined or not.
+     ``--fault TICK:forge`` / ``--fault TICK:drop`` put a small in-process
+     proxy between client and server that, for the first fire at or after
+     TICK, corrupts the response signature or swallows the request -- so the
+     policy's reaction can be seen in a real run (demo instrumentation, not
+     an attack model).
+  5. At the end, runs ``pqc_auth.audit_verify`` against the resulting log
      and prints its PASS/FAIL summary.
 
 What this deliberately is NOT (stated plainly, matching this project's
@@ -72,12 +86,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import json
+import socket
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 
 from pqc_auth.audit_verify import LogVerificationResult, format_report, verify_log
+from pqc_auth.failure_policy import PolicyAction, ReauthSupervisor
 from pqc_auth.orchestration import drive_reauth_from_detector_flags
 from pqc_auth.reauth import DualTriggerReauthController
 from pqc_auth.transport import ReauthClient, ReauthServer
@@ -130,6 +148,61 @@ class _DemoLoopSigner:
     def verify_with_public_key(message: bytes, signature: bytes, public_key: bytes) -> bool:
         expected = hmac.new(public_key, message, hashlib.sha256).digest()
         return hmac.compare_digest(expected, signature)
+
+
+class _FaultProxy:
+    """Demo instrumentation: a TCP relay between ReauthClient and
+    ReauthServer. ``mode`` applies to every connection accepted while it is
+    set: "pass" relays unchanged; "forge" relays the request, then flips one
+    byte of the response's signature (a forged answer to a genuine request);
+    "drop" reads the request and never answers or forwards it (the client
+    sees a timeout, the server never sees the request)."""
+
+    def __init__(self, upstream: tuple[str, int]):
+        self._upstream = upstream
+        self.mode = "pass"
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self._sock.settimeout(0.2)
+        self.host, self.port = self._sock.getsockname()
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                conn, _ = self._sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            threading.Thread(target=self._relay, args=(conn, self.mode), daemon=True).start()
+
+    def _relay(self, conn: socket.socket, mode: str) -> None:
+        with conn:
+            conn.settimeout(30)
+            try:
+                request = conn.makefile("rb").readline()
+                if mode == "drop":
+                    conn.recv(1)  # hold the connection open until the client gives up
+                    return
+                with socket.create_connection(self._upstream, timeout=10) as up:
+                    up.sendall(request)
+                    response = up.makefile("rb").readline()
+                if mode == "forge":
+                    data = json.loads(response)
+                    sig = bytearray(bytes.fromhex(data["signature"]))
+                    sig[0] ^= 0xFF
+                    data["signature"] = sig.hex()
+                    response = json.dumps(data).encode() + b"\n"
+                conn.sendall(response)
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._running = False
+        self._thread.join(timeout=2)
+        self._sock.close()
 
 
 def _make_signer():
@@ -212,6 +285,7 @@ def run_live_loop(
     epochs: int = TRAIN_EPOCHS,
     quiet: bool = False,
     signer_override: tuple | None = None,
+    faults: dict[int, str] | None = None,
 ) -> tuple[list[dict], LogVerificationResult]:
     """Run the live detector-to-reauth loop for real.
 
@@ -234,6 +308,10 @@ def run_live_loop(
     once per actual fire. There is no second controller to keep in sync
     and nothing to desync: the dry-run query and the real fire both read
     and (respectively) leave alone / update the identical state.
+
+    ``faults`` maps tick -> "forge" | "drop" (see ``_FaultProxy``): the fault
+    is armed at that tick and applied to every connection made during the
+    first tick, at or after it, on which a re-auth actually fires.
 
     Returns ``(trace, audit_report)``: ``trace`` is one dict per tick (see
     the fields built below); ``audit_report`` is
@@ -282,14 +360,22 @@ def run_live_loop(
     controller = DualTriggerReauthController(signer=signer)
     server = ReauthServer(controller)
     server.start()
+    proxy = _FaultProxy((server.host, server.port)) if faults else None
     client = ReauthClient(
-        server.host,
-        server.port,
+        proxy.host if proxy else server.host,
+        proxy.port if proxy else server.port,
         verify_fn=verify_fn,
         expected_public_key=signer.public_key,
         audit_log_path=str(audit_log_path),
     )
-    _p(f"Server listening on {server.host}:{server.port}\n")
+
+    def _on_alert(slice_type, decision) -> None:
+        _p(f"      POLICY {decision.action.value.upper()} slice={slice_type} rule={decision.rule}: {decision.reason}"
+           f"{' [escalating]' if decision.escalate else ''}{' [QUARANTINED]' if decision.quarantined else ''}")
+
+    supervisor = ReauthSupervisor(client, on_alert=_on_alert)
+    _p(f"Server listening on {server.host}:{server.port}" + (f" (via fault proxy on :{proxy.port})" if proxy else "") + "\n")
+    pending_faults = dict(sorted((faults or {}).items()))
 
     trace: list[dict] = []
     try:
@@ -313,6 +399,13 @@ def run_live_loop(
             reauth_fired = False
             fired_reason = None
             client_result = None
+            supervised = None
+            fault = None
+            armed = [t for t in pending_faults if t <= tick]
+            if decisions and armed and proxy is not None:
+                fault = pending_faults.pop(armed[0])
+                proxy.mode = fault
+            quarantined_before = supervisor.is_quarantined(MONITORED_SLICE)
             for decision in decisions:
                 reauth_fired = True
                 fired_reason = decision.outcome.reason.value
@@ -320,8 +413,12 @@ def run_live_loop(
                 # calls controller.reauth() for real (dry_run=False, its
                 # default) -- the one place state is mutated and signing
                 # happens, on the SAME controller instance the dry run
-                # above just queried.
-                client_result = client.request_reauth(decision.slice_type, now, detector_alert=predicted_anomaly)
+                # above just queried. The supervisor applies the failure
+                # policy to whatever comes back.
+                supervised = supervisor.reauth(decision.slice_type, now, detector_alert=predicted_anomaly)
+                client_result = supervised.result
+            if proxy is not None:
+                proxy.mode = "pass"
 
             entry = {
                 "tick": tick,
@@ -336,16 +433,30 @@ def run_live_loop(
                 "trusted": client_result.trusted if client_result is not None else None,
                 "rejected_as_replay": client_result.rejected_as_replay if client_result is not None else None,
                 "pinned_key_mismatch": client_result.pinned_key_mismatch if client_result is not None else None,
+                "fault_injected": fault,
+                "outcome": client_result.outcome.value if client_result is not None else None,
+                "attempts": [a.outcome.value for a in client_result.attempts] if client_result is not None else [],
+                "policy_action": supervised.decision.action.value if supervised is not None else None,
+                "policy_rule": supervised.decision.rule if supervised is not None else None,
+                "escalation_outcome": (
+                    supervised.escalation.result.outcome.value
+                    if supervised is not None and supervised.escalation is not None else None
+                ),
+                "quarantined_before": quarantined_before,
+                "quarantined_after": supervisor.is_quarantined(MONITORED_SLICE),
             }
             trace.append(entry)
 
             reauth_desc = f"fired({fired_reason})" if reauth_fired else "no"
             trust_desc = (
-                f"trusted={client_result.trusted} replay_rejected={client_result.rejected_as_replay} "
-                f"pinned_key_mismatch={client_result.pinned_key_mismatch}"
+                f"outcome={client_result.outcome.value} attempts={len(client_result.attempts)} "
+                f"policy={supervised.decision.action.value}"
+                + (" (quarantine cleared)" if supervised.decision.rule == "quarantine_cleared" else "")
+                + (f" escalation->{entry['escalation_outcome']}" if entry["escalation_outcome"] else "")
+                + (f" [fault injected: {fault}]" if fault else "")
                 if client_result is not None
                 else ""
-            )
+            ) + (" [slice QUARANTINED]" if entry["quarantined_after"] else "")
             _p(
                 f"tick {tick:>3} row={row:>3} slice={MONITORED_SLICE} "
                 f"detector={'ANOMALY' if predicted_anomaly else 'clean  '} "
@@ -357,6 +468,8 @@ def run_live_loop(
             if interval_seconds > 0:
                 time.sleep(interval_seconds)
     finally:
+        if proxy is not None:
+            proxy.stop()
         server.stop()
 
     _p(f"\nIndependently auditing {audit_log_path} ...\n")
@@ -369,10 +482,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ticks", type=int, default=None, help="number of held-out windows to stream (default: the whole test split)")
     parser.add_argument("--interval-seconds", type=float, default=0.0, help="real wall-clock seconds to sleep between ticks (default: 0, no sleep)")
+    parser.add_argument("--fault", action="append", default=[], metavar="TICK:forge|drop",
+                        help="inject a fault at the first fire at/after TICK (demo instrumentation; repeatable)")
     args = parser.parse_args(argv)
 
+    faults = {}
+    for spec in args.fault:
+        tick, _, mode = spec.partition(":")
+        if mode not in ("forge", "drop") or not tick.isdigit():
+            parser.error(f"--fault expects TICK:forge or TICK:drop, got {spec!r}")
+        faults[int(tick)] = mode
+
     LIVE_LOOP_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    _, report = run_live_loop(ticks=args.ticks, interval_seconds=args.interval_seconds)
+    _, report = run_live_loop(ticks=args.ticks, interval_seconds=args.interval_seconds, faults=faults or None)
     return 0 if report.all_clean else 1
 
 
