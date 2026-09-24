@@ -16,9 +16,9 @@ pure/testable construction from privileged execution:
     clean-only and a covert-carrying traffic plan per slice over real
     veths, captures each with capture.py, and runs the SAME detector
     against the real captured gaps. Requires root/CAP_NET_ADMIN (checked
-    via ``netns_privileges_available``, the identical probe
-    tests/test_network_live_integration.py's setUp already uses -- not
-    reimplemented differently here) plus tshark/tcpdump. Self-skips with a
+    via ``netns_privileges_available``, a thin wrapper around
+    topology.netns_privilege_skip_reason() -- the one privilege check that
+    tests/test_network_live_integration.py also uses) plus tshark/tcpdump. Self-skips with a
     clear reason if either is missing rather than failing confusingly.
 
 ``build_covert_traffic_plan`` is the "thin wrapper" the covert_injector.py
@@ -70,7 +70,7 @@ from network_covert_channel.covert_injector import (
     NonAdaptiveCovertInjector,
 )
 from network_covert_channel.timing_detector import TimingKSDetector
-from network_covert_channel.topology import NetnsTopology
+from network_covert_channel.topology import NetnsTopology, netns_privilege_skip_reason
 from network_covert_channel.traffic import (
     TrafficPacketPlan,
     build_traffic_plan,
@@ -99,24 +99,14 @@ class SliceDemoResult:
 
 
 def netns_privileges_available() -> tuple[bool, str]:
-    """Probes for root/CAP_NET_ADMIN by attempting to create (and then
-    delete) a throwaway network namespace -- the same probe pattern
-    tests/test_network_live_integration.py's setUp uses (a separate
-    implementation, not shared code, since that test predates this
-    module). Returns (available, message); message explains why when
+    """(available, message) form of topology.netns_privilege_skip_reason(),
+    the single privilege check for everything that needs real namespaces
+    -- delegated to rather than reimplemented, so the live demo, its test
+    and Phase 1's live test can never disagree. message explains why when
     available is False."""
-    try:
-        probe = subprocess.run(
-            ["ip", "netns", "add", "__ncc_covert_demo_probe__"], capture_output=True, text=True
-        )
-    except OSError as exc:
-        return False, f"requires the 'ip' binary (iproute2), not found on PATH ({exc})"
-    if probe.returncode != 0:
-        return False, (
-            "requires root/CAP_NET_ADMIN to create network namespaces "
-            f"(probe failed: {probe.stderr.strip()})"
-        )
-    subprocess.run(["ip", "netns", "delete", "__ncc_covert_demo_probe__"], capture_output=True)
+    reason = netns_privilege_skip_reason()
+    if reason is not None:
+        return False, reason
     return True, "root/CAP_NET_ADMIN available"
 
 
