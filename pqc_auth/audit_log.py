@@ -83,6 +83,12 @@ class AuditLogger:
         now: float | None = None,
         attempt: int | None = None,
         request_id: str | None = None,
+        key_rotation_accepted: bool = False,
+        rotation_statements: list[dict] | None = None,
+        previous_public_key: bytes | None = None,
+        previous_epoch: int | None = None,
+        new_epoch: int | None = None,
+        rotation_rejected_reason: str | None = None,
     ) -> dict:
         """Append one record and return it as the dict that was written.
 
@@ -109,6 +115,16 @@ class AuditLogger:
         attempt's result is explicit in the log and the failure policy's
         decision records can point at it. Omitted, the record keeps its
         earlier shape.
+
+        ``key_rotation_accepted`` marks a response whose key differed from
+        the TOFU pin and was accepted along a signed rotation chain
+        (pqc_auth/key_rotation.py). It must come with the chain actually
+        applied (``rotation_statements``, oldest first, each
+        ``{"statement": hex, "signature": hex}``), the key it replaced
+        (``previous_public_key``) and both epochs, so pqc_auth/audit_verify.py
+        can re-verify every link under the previously trusted key.
+        ``rotation_rejected_reason`` records why a key change was NOT
+        accepted as a rotation. All are written only when set.
         """
         fields = {
             "seq": self._next_seq,
@@ -133,6 +149,15 @@ class AuditLogger:
             fields["challenge_mismatch"] = bool(challenge_mismatch)
         elif challenge_mismatch:
             raise ValueError("challenge_mismatch requires signed_payload and expected_challenge")
+        if key_rotation_accepted:
+            if not rotation_statements or previous_public_key is None or new_epoch is None or previous_epoch is None:
+                raise ValueError("key_rotation_accepted requires the applied statements, previous key and epochs")
+            fields.update(
+                key_rotation_accepted=True, rotation_statements=rotation_statements,
+                previous_public_key=previous_public_key.hex(), previous_epoch=previous_epoch, new_epoch=new_epoch,
+            )
+        if rotation_rejected_reason is not None:
+            fields["rotation_rejected_reason"] = rotation_rejected_reason[:200]
         if outcome is not None:
             fields.update(
                 record_type="verification", outcome=outcome, status=status, now=now,
