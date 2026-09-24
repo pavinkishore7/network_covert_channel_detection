@@ -331,6 +331,30 @@ class MalformedInputTests(_ServerCase):
         self.assertGreaterEqual(served[-1]["sign_ms"], 0.0)
         self.assertGreaterEqual(served[-1]["verify_ms"], 0.0)
 
+    def test_a_failed_send_is_recorded_after_the_served_line(self):
+        """The served line is written before the send; a send that then
+        fails must be corrected by a later send_failed record, not left
+        silently claiming the answer went out."""
+
+        class BrokenPipeConn:
+            def __init__(self):
+                self._request = b'{"v": 2, "slice_type": "eMBB", "now": 1, "detector_alert": true, ' \
+                                b'"client_challenge": "' + (b"ab" * 32) + b'"}\n'
+
+            def recv(self, _n):
+                chunk, self._request = self._request, b""
+                return chunk
+
+            def sendall(self, _data):
+                raise BrokenPipeError("peer went away")
+
+        with self.assertRaises(BrokenPipeError):
+            self.server._handle_connection(BrokenPipeConn(), ("127.0.0.1", 1))
+        records = [json.loads(l) for l in self.served_log.read_text().splitlines()]
+        self.assertEqual([r["event"] for r in records], ["served", "error"])
+        self.assertEqual(records[1]["code"], "send_failed")
+        self.assertEqual(records[1]["server_nonce"], records[0]["server_nonce"])
+
 
 class ChallengeAuditTests(_ServerCase):
     """audit_verify on logs containing challenge-mismatch records."""
