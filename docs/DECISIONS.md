@@ -4,6 +4,17 @@ Format: Date — Decision — Why — Alternatives rejected
 
 ---
 
+**2026-09-24 — PHY detector: physics-informed multi-scale scan detector; CNN-AE kept as baseline**
+Why: the trained CNN-AE and structured-DAE scores correlate with plain eMBB-masked input energy at r = 0.99999999 (both collapsed to a near-constant reconstruction), so the old results were an energy detector and the two "methods" were one. The attack is 32 of 12,800 cells; mean pooling dilutes it ~400x. New detector: per-cell residual (blind power-level or allocation-aware) + max over a generic 16-window scan. Evaluated in detector/evaluate_scan_detector.py.
+Alternatives rejected: tuning the scan window to the attack's burst shape; weakening the attacker.
+
+**2026-09-24 — Attacker placement: random burst position (default); legacy "first" kept**
+Why: both attackers always wrote their 32 symbols into the first eMBB cells in row-major order, so every attack sat at the start of the grid — a modelling artifact. Now a contiguous burst at a random position; size and magnitude unchanged. placement="first" reproduces the old frozen dataset bit-for-bit (checked). results/cnn_autoencoder_*, structured_dae_*, adaptive_benchmark_v1* predate this and use the legacy placement.
+Also added BandLimitedAdaptiveAttacker, a STRONGER stress-test attacker that stays inside the legal power band.
+
+**2026-09-24 — adaptive_benchmark_v1.csv superseded**
+Why: produced by detector/legacy/adaptive_residual.py with a different configuration (64 covert bits, fading channel profiles, SNR 8–24 dB), not the frozen-dataset protocol; its adaptive > non-adaptive AUC is not comparable with the frozen-dataset results. Kept for history; don't cite.
+
 **2026-09 — Adaptive residual guard added for reproducible benchmark evaluation**
 Why: TensorFlow CNN experiments are not portable to every reviewer environment,
 and the prior smoke test had no held-out adaptive result. The clean-calibrated
