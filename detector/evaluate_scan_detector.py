@@ -209,10 +209,11 @@ def main() -> None:
                              "tested_on": name, "n_per_class": len(pc), "roc_auc": fast_auc(pc, px),
                              "auc_ci_low": lo, "auc_ci_high": hi})
 
-    pd.DataFrame(rows).to_csv(out / "scan_detector_results.csv", index=False)
-    pd.DataFrame(base_rows).to_csv(out / "scan_baseline_energy.csv", index=False)
-    pd.DataFrame(agg_rows).to_csv(out / "scan_aggregation_results.csv", index=False)
-    pd.DataFrame(gen_rows).to_csv(out / "scan_generalization_results.csv", index=False)
+    # Rounding makes the CSVs reproducible across scipy/numpy versions (they differed by <=3.4e-13 between scipy 1.17.1 and 1.18.0).
+    pd.DataFrame(rows).round(6).to_csv(out / "scan_detector_results.csv", index=False)
+    pd.DataFrame(base_rows).round(6).to_csv(out / "scan_baseline_energy.csv", index=False)
+    pd.DataFrame(agg_rows).round(6).to_csv(out / "scan_aggregation_results.csv", index=False)
+    pd.DataFrame(gen_rows).round(6).to_csv(out / "scan_generalization_results.csv", index=False)
     print(pd.DataFrame(rows)[["snr", "residual", "attack", "roc_auc", "auc_ci_low", "auc_ci_high", "fpr",
                               "detection_rate"]].to_string(index=False))
 

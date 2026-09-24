@@ -11,6 +11,7 @@ Code: `detector/scan_detector.py`. Evaluation: `python -m detector.generate_froz
 
 ## Results
 200 test scenarios per class per SNR; 95% bootstrap CIs. Full tables: `results/report/tables.md`.
+CSVs are rounded to 6 decimals; reproduction is checked to ±1e-6 because some bootstrap CI bounds fall exactly on a rounding tie.
 - **Non-adaptive attacker:** AUC 0.965 at 10 dB and 1.000 from 15 dB. The CNN-AE baseline gets 0.649 and 0.787.
 - **Adaptive attacker:** 0.812 at 15 dB and 1.000 from 20 dB. The baseline gets 0.572 and 0.604.
 - **Observing more frames** (adaptive attacker, 15 dB, allocation residual): 0.80 at 1 frame → 0.89 at 2 → 0.97 at 4 → 1.00 at 16.
