@@ -106,3 +106,26 @@ def test_detector_separates_non_adaptive_at_high_snr():
         atk_maps.append(level_residual(NonAdaptiveAttacker(AttackerConfig(seed=seed)).inject(g, a["eMBB"].subcarrier_mask)))
     assert det.flag(np.stack(atk_maps)).mean() > 0.9
     assert det.flag(np.stack(clean_maps[150:])).mean() < 0.2
+
+
+def test_payload_size_controls_cells_changed_and_sqrt_law_energy():
+    """n_covert_bits sets how many cells the attackers touch; the adaptive attacker's
+    per-cell size falls with n (sqrt law), the non-adaptive one's does not."""
+    g, alloc = _clean(3, snr=20.0)
+    mask = alloc["eMBB"].subcarrier_mask
+    mags = {}
+    for n in (8, 512):
+        na = NonAdaptiveAttacker(AttackerConfig(seed=1, n_covert_bits=n)).inject(g, mask) - g
+        ad = AdaptiveAttacker(AttackerConfig(seed=1, n_covert_bits=n)).inject(g, mask) - g
+        assert (na != 0).sum() == n and (ad != 0).sum() == n
+        assert np.allclose(np.abs(na[na != 0]), 0.5)
+        mags[n] = np.abs(ad[ad != 0]).mean()
+    assert mags[512] < mags[8]
+
+
+def test_payload_sweep_smoke():
+    from detector.sweep_payload import run
+    df = run(calib=60, snrs=(20,), payloads=(8, 64), scenarios=6)
+    assert len(df) == 2 * 3 * 2  # residuals x attackers x payloads
+    assert set(df.n_covert_bits) == {8, 64}
+    assert df.roc_auc.between(0, 1).all()

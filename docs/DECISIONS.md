@@ -63,6 +63,11 @@ separately. Do not claim "detects adaptive attacks" until there's an
 actual ROC/AUC number against AdaptiveAttacker output — smoke test alone
 (5 epochs, 30 samples) showed 10%/10%, i.e. no discrimination yet.
 
+**2026-09-25 — Payload-size sweep: n = 32 is the adaptive attacker's MOST detectable payload**
+Why: "only 0.25% of cells" needed evidence. detector/sweep_payload.py (n = 8..2048, 10/15/20 dB, same seeds; n=32 reproduces the main CSV).
+Adaptive AUC at 20 dB: 0.994 / 1.000 / 0.997 / 0.824 / 0.590. Its total energy stays ~1.66 for n >= 32 (sqrt law), so longer messages evade.
+Claims "detects the adaptive attacker at >= 20 dB" hold only for n <= 128; report must say so. Non-adaptive: harder only at small n.
+
 ---
 
 Add new entries above this line. Keep each entry under 5 lines — if you
