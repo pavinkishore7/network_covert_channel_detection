@@ -46,6 +46,7 @@ from scapy.all import IP, UDP, Raw, send
 
 from slicing_sim.ofdm_grid import SLICE_PROFILES, SLICE_TYPES
 
+DEFAULT_STEADY_JITTER_FRAC = 0.05  # steady-component std as a fraction of the base gap (see generate_inter_packet_gaps)
 DEFAULT_BASE_GAP_S = 0.01  # 10ms baseline spacing shared across slices before burstiness reshapes it
 DEFAULT_PAYLOAD_BYTES = 64
 DEFAULT_PORT = 50000
@@ -83,11 +84,20 @@ def generate_inter_packet_gaps(
     n_packets: int,
     rng: np.random.Generator,
     base_gap_s: float = DEFAULT_BASE_GAP_S,
+    steady_jitter_frac: float = DEFAULT_STEADY_JITTER_FRAC,
 ) -> np.ndarray:
     """Inter-packet gaps (seconds), shaped by ``slice_type``'s burstiness.
     See module docstring for the blend model. Deterministic given ``rng``'s
     state, so tests can seed it and compare distributions across slices.
+
+    ``steady_jitter_frac`` is the steady component's standard deviation as a
+    fraction of ``base_gap_s``. The default (0.05) is the original model and
+    reproduces its output bit-for-bit; it makes steady traffic very regular,
+    which is what the extended sweep (network_covert_channel/sweep_extended.py)
+    varies to show how much timing-channel detectability depends on it.
     """
+    if steady_jitter_frac < 0:
+        raise ValueError("steady_jitter_frac must be non-negative")
     if slice_type not in SLICE_PROFILES:
         raise ValueError(f"unknown slice_type {slice_type!r}, expected one of {SLICE_TYPES}")
     if n_packets <= 0:
@@ -95,7 +105,7 @@ def generate_inter_packet_gaps(
 
     burstiness = SLICE_PROFILES[slice_type]["burstiness"]
 
-    steady = rng.normal(base_gap_s, base_gap_s * 0.05, size=n_packets)
+    steady = rng.normal(base_gap_s, base_gap_s * steady_jitter_frac, size=n_packets)
 
     on = True
     bursty = np.empty(n_packets)
