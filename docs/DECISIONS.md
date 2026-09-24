@@ -4,6 +4,13 @@ Format: Date — Decision — Why — Alternatives rejected
 
 ---
 
+**2026-09-24 — TensorFlow detector rebuilt as a fully-convolutional CNN (ML component)**
+Why: the CNN-AE collapsed (dense bottleneck + mean pooling). New model: 5 conv layers with BatchNorm, no dense layer, a per-cell evidence map and log-sum-exp pooling (plain max pooling did not train: crop val AUC ~0.55 vs ~0.86), inputs = raw grid + level residual (+ allocation residual), trained supervised on 32-symbol crops with hard negatives. Result: adaptive AUC 0.96–0.99 at 20 dB (CNN-AE: 0.60); it matches but does not beat the handcrafted scan detector (15 dB: 0.67 vs 0.81). Weakness: it degrades on payload sizes it never saw (256 bits).
+Alternatives rejected: reporting the CNN as better than the scan (it isn't); training on the frozen test scenarios.
+
+**2026-09-24 — Throughput vs detectability sweep**
+Why: the Phase 1 novelty claim promised throughput curves. detector/evaluate_throughput.py varies n_covert_bits (8–256 per frame) for both attackers. Finding: the adaptive attacker's detectability peaks at 32 bits and falls for larger payloads (its square-root-law rule spreads a roughly constant energy over more cells), so at 15 dB it sends 256 bits/frame (~36 kbit/s at 30 kHz SCS) at AUC 0.56.
+
 **2026-09-24 — PHY detector: physics-informed multi-scale scan detector; CNN-AE kept as baseline**
 Why: the trained CNN-AE and structured-DAE scores correlate with plain eMBB-masked input energy at r = 0.99999999 (both collapsed to a near-constant reconstruction), so the old results were an energy detector and the two "methods" were one. The attack is 32 of 12,800 cells; mean pooling dilutes it ~400x. New detector: per-cell residual (blind power-level or allocation-aware) + max over a generic 16-window scan. Evaluated in detector/evaluate_scan_detector.py.
 Alternatives rejected: tuning the scan window to the attack's burst shape; weakening the attacker.
