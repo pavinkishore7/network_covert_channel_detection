@@ -41,7 +41,8 @@ class OqsDilithiumSigner:
     Key storage here is PLAINTEXT ON DISK. This is acceptable only for this
     project's demo/review purposes -- there is no encryption at rest, no
     access control beyond whatever OS file permissions the process happens
-    to have, and no key rotation. Do not treat this as a production
+    to have, and rotation only through pqc_auth/key_rotation.py (manual,
+    signed by the old key, no revocation). Do not treat this as a production
     key-management approach.
     """
 
