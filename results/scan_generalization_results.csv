@@ -1,0 +1,22 @@
+snr,features,trained_on,tested_on,n_per_class,roc_auc,auc_ci_low,auc_ci_high
+0,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,0.511111,0.41166,0.622514
+0,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.502222,0.401111,0.613639
+0,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.39384,0.602253
+5,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,0.560556,0.460812,0.659194
+5,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.5175,0.407208,0.60725
+5,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.385951,0.600583
+10,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,0.813611,0.733583,0.881958
+10,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.522778,0.409146,0.627799
+10,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.394139,0.600986
+15,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,1.0,1.0
+15,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.738333,0.651361,0.825868
+15,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.397625,0.604778
+20,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,1.0,1.0
+20,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.990556,0.97,1.0
+20,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.403597,0.601389
+25,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,1.0,1.0
+25,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,1.0,1.0,1.0
+25,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.394299,0.602941
+30,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,1.0,1.0
+30,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,1.0,1.0,1.0
+30,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.5,0.390094,0.595288

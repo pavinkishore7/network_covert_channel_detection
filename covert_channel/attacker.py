@@ -34,6 +34,33 @@ class AttackerConfig:
     n_covert_bits: int = 32
     target_slice: str = "eMBB"     # slice whose subcarriers get perturbed
     seed: int | None = None
+    # Where the covert symbols go inside the target slice's cells.
+    #   "random_burst" (default): a contiguous burst of target cells (row-major,
+    #       i.e. time-then-frequency order) starting at a random OFDM symbol, so
+    #       the attack can appear anywhere in the grid.
+    #   "first": the first n target cells in row-major order, i.e. always at the
+    #       start of the grid. This was the only behaviour before 2026-09-24; it
+    #       is kept only so earlier results can be reproduced exactly. It is a
+    #       modelling artifact (a real attacker has no reason to always transmit
+    #       in the first symbol).
+    placement: str = "random_burst"
+
+
+def _select_slots(target_idx: np.ndarray, n_bits: int, placement: str,
+                  rng: np.random.Generator) -> np.ndarray:
+    """Pick the (t, f) cells that carry covert symbols.
+
+    Only the *position* of the burst is randomised; its size and the
+    per-symbol magnitude are unchanged, so detectability is not made easier or
+    harder by this choice other than removing the fixed-position artifact.
+    """
+    n_slots = min(n_bits, len(target_idx))
+    if placement == "first":
+        return target_idx[:n_slots]
+    if placement != "random_burst":
+        raise ValueError(f"unknown placement: {placement!r}")
+    start = int(rng.integers(0, len(target_idx) - n_slots + 1))
+    return target_idx[start:start + n_slots]
 
 
 class NonAdaptiveAttacker:
@@ -60,9 +87,8 @@ class NonAdaptiveAttacker:
         if len(target_idx) == 0:
             return grid
 
-        n_slots = min(len(bits), len(target_idx))
-        for i in range(n_slots):
-            t, f = target_idx[i]
+        slots = _select_slots(target_idx, len(bits), self.cfg.placement, self.rng)
+        for i, (t, f) in enumerate(slots):
             grid[t, f] += fixed_magnitude if bits[i] else -fixed_magnitude
 
         return grid
@@ -117,14 +143,43 @@ class AdaptiveAttacker:
         # base_magnitude alone doesn't guarantee this, so enforce it directly.
         ceiling = fixed_magnitude * 0.6
 
-        n_slots = min(len(bits), len(target_idx))
-        for i in range(n_slots):
-            t, f = target_idx[i]
+        slots = _select_slots(target_idx, len(bits), self.cfg.placement, self.rng)
+        for i, (t, f) in enumerate(slots):
             shaped = magnitude * local_std * self.rng.normal(1.0, 0.15)
             shaped = np.clip(shaped, -ceiling, ceiling)
             grid[t, f] += shaped if bits[i] else -shaped
 
         return grid
+
+
+class BandLimitedAdaptiveAttacker(AdaptiveAttacker):
+    """Stress-test attacker that knows the clean power model and hides in it.
+
+    Same sqrt-law magnitude and shaping as AdaptiveAttacker, but every
+    perturbed cell is clipped so its value stays inside the allocated-power
+    band a clean cell can take (``band``; see slicing_sim/ofdm_grid.py).
+    A detector that only checks "is this cell at a legal power level" cannot
+    see it by construction; only a detector that knows what was actually
+    scheduled can. It is deliberately STRONGER than AdaptiveAttacker, added
+    to test the detector, not to make it look good.
+    """
+
+    def __init__(self, config: AttackerConfig, band: tuple[float, float] = (0.8, 1.0)):
+        super().__init__(config)
+        self.band = band
+
+    def inject(self, interference_grid: np.ndarray, target_mask: np.ndarray,
+               fixed_magnitude: float = 0.5) -> np.ndarray:
+        perturbed = super().inject(interference_grid, target_mask, fixed_magnitude)
+        changed = perturbed != interference_grid
+        lo, hi = self.band
+        # keep each touched cell inside the legal band (or leave it as the
+        # clean value if the clean value itself was already outside it)
+        clean = interference_grid[changed]
+        inside = (clean >= lo) & (clean <= hi)
+        clipped = np.clip(perturbed[changed], lo, hi)
+        perturbed[changed] = np.where(inside, clipped, clean)
+        return perturbed
 
 
 class ReactiveJammer:
