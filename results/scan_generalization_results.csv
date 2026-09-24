@@ -1,0 +1,22 @@
+snr,features,trained_on,tested_on,n_per_class,roc_auc,auc_ci_low,auc_ci_high
+0,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,0.5111111111111111,0.41165972222222225,0.6225138888888888
+0,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.5022222222222222,0.40111111111111114,0.6136388888888888
+0,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.3938402777777778,0.602253472222222
+5,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,0.5605555555555556,0.46081249999999996,0.6591944444444444
+5,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.5175,0.40720833333333334,0.60725
+5,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.38595138888888886,0.6005833333333332
+10,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,0.8136111111111111,0.7335833333333333,0.8819583333333333
+10,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.5227777777777778,0.4091458333333333,0.6277986111111111
+10,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.3941388888888889,0.6009861111111111
+15,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,0.9999999999999999,1.0
+15,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.7383333333333333,0.6513611111111111,0.8258680555555555
+15,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.397625,0.6047777777777776
+20,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,0.9999999999999999,1.0
+20,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,0.9905555555555555,0.97,1.0
+20,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.4035972222222223,0.6013888888888889
+25,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,0.9999999999999999,1.0
+25,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,1.0,0.9999999999999999,1.0
+25,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.39429861111111114,0.6029409722222223
+30,level multiscale (17),clean vs non_adaptive,non_adaptive (seen),60,1.0,0.9999999999999999,1.0
+30,level multiscale (17),clean vs non_adaptive,adaptive (unseen),60,1.0,0.9999999999999999,1.0
+30,level multiscale (17),clean vs non_adaptive,band_limited_adaptive (unseen),60,0.49999999999999994,0.39009374999999996,0.5952881944444444
