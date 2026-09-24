@@ -1,6 +1,7 @@
 """Regenerate the PHY-detector report figures from the CSVs in results/.
 
-Reads only results/scan_*.csv (written by detector/evaluate_scan_detector.py) and
+Reads only results/scan_*.csv (written by detector/evaluate_scan_detector.py and
+detector/sweep_payload.py) and
 writes 300-dpi PNGs to results/report/. Styles are distinguishable in grayscale
 (line style + marker), and every AUC point carries its 95% bootstrap CI.
 """
@@ -13,6 +14,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 R = Path("results")
@@ -93,6 +95,33 @@ def fig_generalization():
     fig.savefig(OUT / "fig_phy_generalization.png", dpi=300)
 
 
+def fig_payload_sweep():
+    """AUC vs payload size (n_covert_bits), allocation-aware residual; one panel per SNR."""
+    path = R / "scan_payload_sweep.csv"
+    if not path.exists():
+        print("skip fig_phy_payload_sweep.png: run python -m detector.sweep_payload first")
+        return
+    d = pd.read_csv(path)
+    d = d[d.residual == "allocation"]
+    snrs = sorted(d.snr.unique())
+    fig, axes = plt.subplots(1, len(snrs), figsize=(3.2 * len(snrs), 3.8), sharey=True)
+    for ax, snr in zip(np.atleast_1d(axes), snrs):
+        for atk, label, c, ls, m in [("non_adaptive", "non-adaptive", "k", "-", "o"),
+                                     ("adaptive", "adaptive (sqrt-law)", "0.5", "-", "s"),
+                                     ("band_limited_adaptive", "band-limited adaptive", "0.3", ":", "^")]:
+            df = d[(d.snr == snr) & (d.attack == atk)].sort_values("n_covert_bits")
+            ax.errorbar(df.n_covert_bits, df.roc_auc, yerr=_err(df), label=label, color=c, ls=ls, marker=m, capsize=3, ms=5)
+        ax.axvline(32, color="0.8", lw=0.8, ls="--")
+        ax.axhline(0.5, color="0.7", lw=0.8)
+        ax.set_xscale("log", base=2)
+        ax.set(xlabel="covert symbols per grid, n (log scale)", title=f"{snr} dB", ylim=(0.4, 1.02))
+    np.atleast_1d(axes)[0].set_ylabel("ROC-AUC (95% CI)")
+    np.atleast_1d(axes)[-1].legend(fontsize=7, loc="lower right")
+    fig.suptitle("Scan detector (allocation-aware) vs payload size; dashed line = n = 32 used elsewhere", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_phy_payload_sweep.png", dpi=300)
+
+
 def tables_md():
     scan = pd.read_csv(R / "scan_detector_results.csv")
     base = pd.read_csv(R / "scan_baseline_energy.csv")
@@ -146,5 +175,6 @@ if __name__ == "__main__":
     fig_aggregation()
     fig_generalization()
     fig_net_detection_vs_offset()
+    fig_payload_sweep()
     tables_md()
     print("wrote", sorted(p.name for p in OUT.iterdir()))
