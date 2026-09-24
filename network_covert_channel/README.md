@@ -135,8 +135,8 @@ setup.
 ## Phase 2: covert channel + classical detector
 
 **Scope: `covert_injector.py` (the covert channel), `timing_detector.py`
-(the detector), and `covert_demo.py` (end-to-end composition + live
-path). Does NOT include wiring a detector alert into
+(the detector), `covert_demo.py` (end-to-end composition + live
+path), and `sweep.py` (the detection/false-alarm evidence below). Does NOT include wiring a detector alert into
 `pqc_auth.reauth.DualTriggerReauthController` — that is Phase 3, see
 "Phase 3 will need" below. Nothing in `pqc_auth/` or `detector/` is
 touched by Phase 2.**
@@ -176,6 +176,17 @@ clean-vs-clean pairs to build a null distribution of the KS D statistic
 and sets the threshold at its 95th percentile, so the false-positive rate
 is explicit rather than assumed.
 
+Thresholds are **per slice**: `calibrate(..., slice_type=s)` calibrates on
+that slice's own clean gaps, `anomaly_by_slice()` judges each slice by its
+own threshold, and an uncalibrated slice raises `SliceNotCalibratedError`
+rather than borrowing another slice's. The two-sample KS null depends only
+on the sample sizes, not on the gap distribution, so thresholds differ by
+packets per window. With time-based windows the slices hold different
+packet counts. At 2 s windows (141 URLLC packets vs 75 mMTC packets), a
+single threshold calibrated on URLLC flags about 20% of clean mMTC windows;
+mMTC's own threshold flags about 3.5%
+(`tests/test_network_timing_detector.py::PerSliceThresholdTests`).
+
 `anomaly_by_slice()` returns `dict[str, bool]` — checked (not wired in)
 against `pqc_auth.orchestration.drive_reauth_from_detector_flags`'s
 expected input shape via a compatibility test
@@ -184,62 +195,103 @@ that calls it directly with `dry_run=True`. The shapes line up with no
 adaptation needed; nothing in `pqc_auth/` is imported outside that one
 test, and nothing there is modified.
 
-### Measured detection accuracy (synthetic, this session's actual run)
+### Measured detection accuracy (synthetic)
 
-Produced by `python -m network_covert_channel.covert_demo` (300 packets/
-trial, 30 independent trials per cell, threshold calibrated at the 95th
-percentile of 100 clean-vs-clean trials) — reproducible, not hand-picked:
+Produced by `python -m network_covert_channel.sweep` and written to
+`results/phase2_sweep.csv`: all 30 rows, with 95% Clopper–Pearson
+intervals for every rate. Setup:
 
-| Slice | False-alarm rate (clean-vs-clean) | 20ms offset (large) | 4ms offset (moderate) | 0.6ms offset (marginal) |
-|-------|-----------------------------------|----------------------|--------------------------|----------------------------|
-| URLLC | 6.67%  | 100.00% | 100.00% | 100.00% |
-| eMBB  | 10.00% | 100.00% | 100.00% | 83.33%  |
-| mMTC  | 6.67%  | 100.00% | 100.00% | 40.00%  |
+- seed 2026;
+- 500 covert windows per cell and 500 fresh clean windows per slice for
+  the false-alarm rate;
+- the demo's 300-packet window, each window scored against one fixed clean
+  baseline window per slice;
+- per-slice thresholds at the 95th percentile of 1,000 clean-vs-clean
+  pairs.
 
-**The honest finding is the marginal (0.6ms) column, not the large/
-moderate ones.** At a large enough offset, the KS detector catches the
-covert channel reliably on every slice — that part isn't surprising. What
-*is* worth reporting is that the same small absolute offset is
-meaningfully less detectable on `mMTC` (burstiness=0.8, wide natural gap
-spread swallows a 0.6ms shift) than on `URLLC` (burstiness=0.2, tight
-natural spread makes the same shift stand out more). This is not a fixed
-property of the detector alone — it is a property of how much cover the
-carrier traffic's own natural jitter provides, and it varies by slice.
-`tests/test_network_timing_detector.py`'s `DetectionAccuracyTests`
-encodes this as an assertion (a different, seed-swept measurement that
-also confirms mMTC's marginal-offset detection rate stays below URLLC's),
-not just a one-off demo run — the numbers above and the numbers in that
-test file's docstring differ slightly (different seeds/trial counts) but
-tell the same qualitative story.
+Offsets are multiples of each slice's own clean-gap standard deviation σ.
+"Mean abs perturbation" is what the injector actually applied, averaged
+over all packets (bit-0 packets add nothing). Covert bits/s is the covert
+window's packet rate: one bit per packet.
+
+| Slice | offset/σ | offset (ms) | detection, non-adaptive % [95% CI] | detection, adaptive % [95% CI] | mean abs perturbation, non-adaptive / adaptive (ms) | covert bits/s, non-adaptive / adaptive |
+|---|---|---|---|---|---|---|
+| URLLC | 0.1 | 1.02 | 98.8 [97.4, 99.6] | 97.0 [95.1, 98.3] | 0.51 / 0.48 | 68.0 / 68.2 |
+| URLLC | 0.25 | 2.56 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 1.28 / 1.20 | 64.9 / 65.1 |
+| URLLC | 0.5 | 5.12 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 2.56 / 2.39 | 59.9 / 60.6 |
+| URLLC | 1 | 10.24 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 5.09 / 4.76 | 52.0 / 53.0 |
+| URLLC | 2 | 20.48 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 10.25 / 9.51 | 40.9 / 42.3 |
+| eMBB | 0.1 | 2.57 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 1.29 / 1.20 | 46.4 / 46.2 |
+| eMBB | 0.25 | 6.43 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 3.22 / 3.00 | 42.8 / 42.8 |
+| eMBB | 0.5 | 12.86 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 6.42 / 6.00 | 37.4 / 38.0 |
+| eMBB | 1 | 25.73 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 12.90 / 11.99 | 30.2 / 30.9 |
+| eMBB | 2 | 51.45 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 25.72 / 23.98 | 21.7 / 22.5 |
+| mMTC | 0.1 | 4.11 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 2.05 / 1.91 | 35.0 / 35.4 |
+| mMTC | 0.25 | 10.27 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 5.15 / 4.79 | 31.5 / 32.2 |
+| mMTC | 0.5 | 20.54 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 10.19 / 9.58 | 27.2 / 27.8 |
+| mMTC | 1 | 41.09 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 20.53 / 19.22 | 21.3 / 21.8 |
+| mMTC | 2 | 82.18 | 100.0 [99.3, 100.0] | 100.0 [99.3, 100.0] | 41.09 / 38.22 | 14.8 / 15.5 |
+
+| Slice | σ of clean gaps (ms) | window length (300 packets) | false-alarm rate % [95% CI] |
+|---|---|---|---|
+| URLLC | 10.24 | 4.26 s | 0.8 [0.2, 2.0] |
+| eMBB | 25.73 | 6.18 s | 1.6 [0.7, 3.1] |
+| mMTC | 41.09 | 8.00 s | 1.6 [0.7, 3.1] |
+
+**Reading the numbers.**
+
+- **Detection is at least 90% at the smallest offset tested, 0.1σ, on
+  every slice** (URLLC 1.0 ms, eMBB 2.6 ms, mMTC 4.1 ms), for both
+  injectors. The lower CI bound is also at or above 95% at 0.1σ.
+- **This sweep does not locate where detection breaks down**; that lies
+  below 0.1σ. The earlier 30-trial table's 0.6 ms "marginal" offset was
+  about 0.015σ on mMTC, which is consistent with the 40% detection it
+  showed there.
+- **The adaptive injector barely lowers its perturbation.** Its mean
+  absolute perturbation is 93–94% of the non-adaptive one at every offset
+  and on every slice, and its detection rate is the same within the CIs.
+  So explanation (a) holds: **the adaptive variant is weak**. This sweep
+  does not show that the detector is robust to a genuinely adaptive
+  attacker.
+- **The measured false-alarm rate (0.8–1.6%) is below the nominal 5%.**
+  The KS statistic is discrete (steps of 1/300), the decision uses a
+  strict `>`, and every window is compared against one fixed baseline
+  window. The measured rate is the one to use.
 
 A real clean-vs-covert gap-distribution comparison, generated from an
 actual run of `covert_demo.plot_clean_vs_covert` against real synthetic
 gap arrays at the 4ms offset (not mocked or fabricated):
 `results/network_covert_channel_phase2_gap_distributions.png`.
 
-### Live verification status (stated plainly, same standard as Phase 1)
+### Limits
 
-**Live (real-topology) verification did NOT happen for Phase 2, same as
-Phase 1.** Privilege check re-verified fresh in this session
-(2026-09-22, same WSL2 dev environment):
-```
-$ id -u
-1000
-$ ip netns add __ncc_phase2_probe__
-mkdir /run/netns failed: Permission denied
-$ sudo -n true
-sudo: a password is required
-$ which tcpdump tshark ip
-/usr/sbin/ip
-```
-No root/CAP_NET_ADMIN, no passwordless sudo, and neither `tshark` nor
-`tcpdump` is on PATH. `covert_demo.run_live_demo()` and
-`tests/test_network_covert_live_integration.py` are written and ready but
-were not exercised against a real kernel this session — the live test
-self-skips with the exact message above (via `netns_privileges_available()`)
-rather than failing confusingly mid-setup, exactly like Phase 1's live
-test already does. Everything reported above is from the synthetic
-(in-memory) path only.
+- **KS tests only the marginal gap distribution.** This injector adds a
+  delay to about half the gaps, which changes that distribution, so KS is
+  well matched to this attacker. A distribution-preserving timing channel
+  would leave the marginal distribution unchanged and would evade KS by
+  construction. One example is a channel that encodes bits by reordering
+  gaps, or by resampling them from the slice's own clean distribution.
+  This is a known limitation of first-order statistical tests. It is **not**
+  something tested here.
+- **Expected spurious DETECTOR_ALERTs** = measured false-alarm rate ×
+  windows per second, per slice. Window length is 300 packets × the mean
+  clean gap. This is before the controller's 10 s alert cooldown and P2's
+  30 s escalation cooldown; at these rates neither cooldown binds.
+
+  | Slice | window length | windows/s | spurious alerts/s (95% CI upper) | per hour (95% CI upper) |
+  |---|---|---|---|---|
+  | URLLC | 4.26 s | 0.235 | 0.0019 (0.0048) | 6.8 (17.2) |
+  | eMBB | 6.18 s | 0.162 | 0.0026 (0.0051) | 9.3 (18.2) |
+  | mMTC | 8.00 s | 0.125 | 0.0020 (0.0039) | 7.2 (14.1) |
+
+- **Never run on the live topology.** The rootless
+  `unshare --user --map-root-user --mount --net` setup used for P1/P1.5
+  does give `CAP_NET_ADMIN`: inside it, `netns_privileges_available()`
+  returns True. But this machine has neither `tcpdump` nor `tshark`, and
+  installing either needs root, which is unavailable (no passwordless
+  sudo). `tests/test_network_covert_live_integration.py` therefore skips
+  with "requires tshark or tcpdump on PATH". Every number above comes from
+  the synthetic, in-memory path.
 
 ## Phase 3 will need
 
@@ -251,7 +303,6 @@ test already does. Everything reported above is from the synthetic
   Phase 3 is the actual wiring, plus deciding how this vector's alerts
   should interact with the PHY-layer vector's alerts on a slice that both
   could fire on.
-- Actual live-topology verification, once run on a host with root/
-  CAP_NET_ADMIN and a real Linux kernel (this project's dev environment
-  still doesn't have either, per both Phase 1's and Phase 2's privilege
-  checks above).
+- Actual live-topology verification, on a host with a capture tool
+  (`tcpdump`/`tshark`); see "Limits" above. Privilege is not the blocker:
+  the rootless `unshare` setup provides it.
