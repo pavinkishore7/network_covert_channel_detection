@@ -139,6 +139,54 @@ def fig_net_detection_vs_offset():
     fig.savefig(OUT / "fig_net_detection_vs_offset.png", dpi=300)
 
 
+def fig_throughput():
+    p = R / "throughput_detectability.csv"
+    if not p.exists():
+        print("skip throughput (no CSV)")
+        return
+    df = pd.read_csv(p, comment="#")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2), sharey=True)
+    for ax, atk in zip(axes, ["non_adaptive", "adaptive"]):
+        for snr, m, c in [(10, "o", "0.6"), (15, "s", "0.3"), (20, "^", "k")]:
+            d = df[(df.attack == atk) & (df.residual == "allocation") & (df.snr == snr)].sort_values("bits_per_frame")
+            ax.errorbar(d.bits_per_frame, d.roc_auc, yerr=_err(d), label=f"{snr} dB", marker=m, color=c, capsize=3, ms=5)
+        ax.set_xscale("log", base=2)
+        ax.set_xticks([8, 16, 32, 64, 128, 256], ["8", "16", "32", "64", "128", "256"])
+        ax.axhline(0.5, color="0.7", lw=0.8)
+        top = ax.secondary_xaxis("top", functions=(lambda b: b / 7.142857, lambda k: k * 7.142857))
+        top.set_xlabel("covert throughput (kbit/s, 30 kHz SCS)")
+        ax.set(xlabel="covert bits per 200-symbol frame", title=atk.replace("_", "-") + " attacker", ylim=(0.4, 1.02))
+    axes[0].set_ylabel("ROC-AUC (95% CI)")
+    axes[1].legend(fontsize=8, loc="lower left")
+    fig.suptitle("Throughput vs detectability (allocation-aware scan detector, 200 per class)", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_phy_throughput.png", dpi=300)
+
+
+def fig_cnn():
+    p = R / "cnn_scan_results.csv"
+    if not p.exists():
+        print("skip cnn (no CSV)")
+        return
+    cnn = pd.read_csv(p)
+    scan = pd.read_csv(R / "scan_detector_results.csv")
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for model, res, atk, lab, c, ls, m in [
+        ("cnn_seen_allocation", None, "adaptive", "CNN (allocation-aware), adaptive", "k", "-", "s"),
+        ("cnn_seen_blind", None, "adaptive", "CNN (blind), adaptive", "0.5", "-", "s"),
+        (None, "allocation", "adaptive", "Scan (allocation-aware), adaptive", "k", "--", "o"),
+        (None, "level", "adaptive", "Scan (blind), adaptive", "0.5", "--", "o"),
+        ("cnn_nonadapt_blind", None, "adaptive", "CNN (blind) trained w/o adaptive", "0.3", ":", "^")]:
+        d = (cnn[(cnn.model == model) & (cnn.attack == atk) & (cnn.bits_per_frame == 32)] if model
+             else scan[(scan.residual == res) & (scan.attack == atk)]).sort_values("snr")
+        ax.errorbar(d.snr, d.roc_auc, yerr=_err(d), label=lab, color=c, ls=ls, marker=m, capsize=3, ms=5)
+    ax.axhline(0.5, color="0.7", lw=0.8)
+    ax.set(xlabel="SNR (dB)", ylabel="ROC-AUC (95% CI)", ylim=(0.4, 1.02), title="Fully-convolutional CNN vs scan detector (adaptive attacker)")
+    ax.legend(fontsize=7.5, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_phy_cnn_vs_scan.png", dpi=300)
+
+
 if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     fig_auc_vs_snr()
@@ -146,5 +194,7 @@ if __name__ == "__main__":
     fig_aggregation()
     fig_generalization()
     fig_net_detection_vs_offset()
+    fig_throughput()
+    fig_cnn()
     tables_md()
     print("wrote", sorted(p.name for p in OUT.iterdir()))
