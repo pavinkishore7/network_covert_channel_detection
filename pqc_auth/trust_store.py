@@ -24,13 +24,19 @@ What TOFU is, and is NOT (the same trust model SSH uses for host keys):
   taken in this implementation. See pqc_auth/README.md for the fuller
   writeup, including how this interacts with public-key pinning.
 
-Explicitly OUT of scope: certificate authorities, any signed-key
-distribution scheme, key revocation, and rotation-with-continuity -- a
-legitimate, planned key rotation by the server looks IDENTICAL to an
-attack under this scheme. Accepting a new key for an already-known
-``server_id`` requires an explicit, deliberate call to ``force_retrust()``;
-there is no automatic "this looks like a safe rotation" path, and this
-module does not attempt to build one.
+Signed rotation (pqc_auth/key_rotation.py) is the one automatic key-change
+path: a new key is accepted only with a statement signed by the CURRENTLY
+pinned key, carrying an epoch above the one stored here. Each entry
+therefore records the key AND its epoch (0 for a key learned on first
+contact or set by ``force_retrust()`` without one). ``accept_rotation()``
+is the only method that moves a pin because of a statement, and it is a
+compare-and-set: it refuses unless the stored key is still the one the
+statement rotated away from and the new epoch is higher.
+
+Explicitly OUT of scope: certificate authorities, revocation, and recovery
+from a compromised old key. A key change WITHOUT a valid rotation
+statement still looks identical to an attack and still needs a deliberate
+``force_retrust()`` call.
 """
 
 from __future__ import annotations
@@ -47,7 +53,9 @@ class TrustStoreError(Exception):
 
 
 class TrustStore:
-    """Wraps one plaintext JSON file mapping ``server_id -> hex public key``.
+    """Wraps one plaintext JSON file mapping
+    ``server_id -> {"public_key": hex, "epoch": int}``. An entry written
+    before rotation existed (a bare hex string) is read as epoch 0.
 
     A ``server_id`` is a caller-supplied string identifying a logical
     server identity -- deliberately NOT ``host:port``, since a server can
@@ -61,30 +69,42 @@ class TrustStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _load(self) -> dict[str, str]:
+    def _load(self) -> dict[str, dict]:
         if not self.path.exists() or self.path.stat().st_size == 0:
             return {}
-        return json.loads(self.path.read_text())
+        data = json.loads(self.path.read_text())
+        return {
+            server_id: {"public_key": entry, "epoch": 0} if isinstance(entry, str) else entry
+            for server_id, entry in data.items()
+        }
 
-    def _save(self, data: dict[str, str]) -> None:
+    def _save(self, data: dict[str, dict]) -> None:
         self.path.write_text(json.dumps(data, sort_keys=True, indent=2))
 
     def get_trusted_key(self, server_id: str) -> bytes | None:
         """The currently-trusted key for ``server_id``, or ``None`` if this
         identity has never been seen before."""
-        hex_key = self._load().get(server_id)
-        return bytes.fromhex(hex_key) if hex_key is not None else None
+        entry = self._load().get(server_id)
+        return bytes.fromhex(entry["public_key"]) if entry is not None else None
 
-    def trust_first_contact(self, server_id: str, public_key: bytes) -> None:
+    def get_epoch(self, server_id: str) -> int | None:
+        """The rotation epoch of the trusted key, or ``None`` if unknown."""
+        entry = self._load().get(server_id)
+        return int(entry["epoch"]) if entry is not None else None
+
+    def trust_first_contact(self, server_id: str, public_key: bytes, epoch: int = 0) -> None:
         """Record ``public_key`` as trusted for a ``server_id`` that has
         NEVER been seen before. This is the core TOFU write path -- it is
         deliberately a distinct method from ``force_retrust()``, not the
         same code path with a default, and it refuses (raises) rather than
         silently overwriting if ``server_id`` already has a trusted key:
         that situation is a key CHANGE, which must go through
-        ``force_retrust()`` instead so it's always an explicit, deliberate
-        action, never an accidental side effect of calling this method
-        twice.
+        ``force_retrust()`` or ``accept_rotation()`` instead so it's always
+        an explicit action, never an accidental side effect of calling this
+        method twice.
+
+        ``epoch`` is whatever the first response claimed for its key (see
+        ReauthClient) and is exactly as unverified as the key itself.
         """
         data = self._load()
         if server_id in data:
@@ -94,17 +114,35 @@ class TrustStore:
                 "force_retrust() if you deliberately intend to accept a "
                 "new key for this already-known identity"
             )
-        data[server_id] = public_key.hex()
+        data[server_id] = {"public_key": public_key.hex(), "epoch": int(epoch)}
         self._save(data)
 
-    def force_retrust(self, server_id: str, public_key: bytes) -> None:
+    def force_retrust(self, server_id: str, public_key: bytes, epoch: int = 0) -> None:
         """Deliberately accept ``public_key`` as the new trusted key for
         ``server_id``, whether or not one was already recorded. Simulates
-        an operator consciously accepting a known key rotation. Nothing in
-        this module or in ReauthClient calls this automatically -- a
-        caller must invoke it on purpose, exactly once per rotation it
-        chooses to accept.
+        an operator consciously accepting a key change that came without a
+        valid rotation statement. Nothing in this module or in ReauthClient
+        calls this automatically -- a caller must invoke it on purpose.
+        ``epoch`` is the operator's statement of which rotation epoch the
+        key belongs to; the default 0 accepts any later signed rotation.
         """
         data = self._load()
-        data[server_id] = public_key.hex()
+        data[server_id] = {"public_key": public_key.hex(), "epoch": int(epoch)}
+        self._save(data)
+
+    def accept_rotation(self, server_id: str, old_key: bytes, new_key: bytes, new_epoch: int) -> None:
+        """Move the pin for ``server_id`` from ``old_key`` to ``new_key``
+        after a verified rotation chain (pqc_auth/key_rotation.py). The
+        caller has already verified the signatures; this re-checks, against
+        what is on disk right now, that the pin is still ``old_key`` and
+        that ``new_epoch`` is higher than the stored epoch, and raises
+        otherwise -- so a stale or concurrent caller can never roll the
+        pin or its epoch backwards."""
+        data = self._load()
+        entry = data.get(server_id)
+        if entry is None or bytes.fromhex(entry["public_key"]) != old_key:
+            raise TrustStoreError(f"server_id {server_id!r} is no longer pinned to the key this rotation replaces")
+        if new_epoch <= int(entry["epoch"]):
+            raise TrustStoreError(f"rotation epoch {new_epoch} is not above stored epoch {entry['epoch']}")
+        data[server_id] = {"public_key": new_key.hex(), "epoch": int(new_epoch)}
         self._save(data)
