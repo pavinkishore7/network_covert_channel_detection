@@ -27,6 +27,12 @@ Wire format (version 2 -- version 1 is gone, see below):
             {"v": 2, "due": true, "payload": str, "signature": hex,
              "public_key": hex, "backend": str}                      (due)
             {"v": 2, "error": code, "detail": str}                   (request refused)
+  A signed response may also carry ``"rotations": [{"statement": hex,
+  "signature": hex}, ...]`` -- the server's recent key-rotation statements,
+  oldest first (see pqc_auth/key_rotation.py). They sit outside ``payload``
+  on purpose: each statement is authenticated by the OLD key's signature,
+  which is the whole point; having the new key sign them as well would
+  prove nothing about continuity.
 
   ``payload`` is the canonical JSON (``canonical_payload()``: sorted keys,
   no whitespace, ASCII-only, no NaN/Infinity) of
@@ -80,6 +86,15 @@ substitute for real key distribution, and an attacker present on the very
 first connection to a never-before-seen server_id, WITH a validly signed
 response, is indistinguishable from a legitimate first contact.
 
+Signed key rotation: when a TOFU client sees a key other than its pinned
+one, it no longer rejects outright if the response carries a rotation
+chain that verifies from the pinned key (and its stored epoch) to the
+presented key -- see pqc_auth/key_rotation.py for the rules. The new key is
+persisted only after the challenge and verify_fn checks pass under it,
+exactly like first contact. With no chain, or one that fails any check, the
+rejection is the unchanged REJECTED_TOFU_KEY_CHANGED. An explicit
+expected_public_key is never overridden by a rotation statement.
+
 Server robustness: each accepted connection is handled on its own thread,
 up to ``max_connections`` at once; beyond that a new connection is closed
 immediately and logged. Every connection has a read timeout, so an idle
@@ -129,9 +144,12 @@ from pathlib import Path
 from typing import Callable
 
 from pqc_auth.audit_log import AuditLogger
+from pqc_auth.key_rotation import (
+    MAX_CHAIN_LINKS, RotationCheck, RotationFormatError, SignedRotation, verify_rotation_chain,
+)
 from pqc_auth.outcomes import OutcomeCategory, RequestOutcome
 from pqc_auth.reauth import DualTriggerReauthController, ReauthReason
-from pqc_auth.trust_store import TrustStore
+from pqc_auth.trust_store import TrustStore, TrustStoreError
 
 WIRE_VERSION = 2
 
@@ -357,6 +375,7 @@ class ReauthServer:
         connection_timeout: float = DEFAULT_CONNECTION_TIMEOUT_SECONDS,
         max_request_bytes: int = MAX_REQUEST_BYTES,
         max_connections_per_peer: int = DEFAULT_MAX_CONNECTIONS_PER_PEER,
+        rotations: list[SignedRotation] | None = None,
     ):
         if controller.signer is None:
             raise ValueError("ReauthServer requires a controller with a signer configured")
@@ -364,6 +383,10 @@ class ReauthServer:
             raise ValueError("connection limits must be at least 1")
         self.controller = controller
         self.server_id = server_id
+        # Rotation statements attached to every signed response, oldest
+        # first (pqc_auth/key_rotation.py). Only the last MAX_CHAIN_LINKS
+        # are sent; a client further behind needs manual re-trust.
+        self._rotations_wire = [r.to_wire() for r in (rotations or [])[-MAX_CHAIN_LINKS:]]
         self._max_request_bytes = max_request_bytes
         self._connection_timeout = connection_timeout
         self._slots = threading.BoundedSemaphore(max_connections)
@@ -518,7 +541,7 @@ class ReauthServer:
         return signature, (time.perf_counter() - started) * 1000.0
 
     def _signed_response(self, payload: str, signature: bytes) -> dict:
-        return {
+        response = {
             "v": WIRE_VERSION,
             "payload": payload,
             "signature": signature.hex(),
@@ -527,6 +550,9 @@ class ReauthServer:
             # this string, it's informational (logging/demo output).
             "backend": self.backend_name,
         }
+        if self._rotations_wire:
+            response["rotations"] = self._rotations_wire
+        return response
 
     def _refuse(self, conn: socket.socket, addr, code: str, detail: str = "", challenge: bytes | None = None) -> None:
         if challenge is not None:
@@ -598,6 +624,8 @@ class ClientVerificationResult:
     detail: str = ""
     audit_seq: int | None = None  # this attempt's audit-log record
     attempts: list[AttemptRecord] = field(default_factory=list)
+    key_rotation_accepted: bool = False  # the TOFU pin moved along a verified rotation chain
+    trusted_epoch: int | None = None  # the pin's rotation epoch after this response (TOFU only)
 
     @property
     def category(self) -> OutcomeCategory | None:
@@ -616,6 +644,7 @@ class _ParsedResponse:
     signature: bytes
     public_key: bytes
     backend: str | None
+    rotations: object = None  # raw "rotations" list; only parsed on a TOFU key change
 
 
 def _parse_response(response) -> _ParsedResponse | None:
@@ -640,6 +669,7 @@ def _parse_response(response) -> _ParsedResponse | None:
             signature=bytes.fromhex(response["signature"]),
             public_key=bytes.fromhex(response["public_key"]),
             backend=response.get("backend"),
+            rotations=response.get("rotations"),
         )
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
@@ -719,7 +749,10 @@ class ReauthClient:
     -- whereas TOFU-learned trust is, by construction, only ever as good
     as whatever showed up first over the wire. A caller who supplies both
     has already done the stronger thing; falling back to the weaker
-    mechanism underneath it would silently discard that guarantee.
+    mechanism underneath it would silently discard that guarantee. The same
+    holds for signed rotation: a rotation statement only ever moves a
+    TOFU-learned pin, never an explicit ``expected_public_key`` (the trust
+    store, where rotation lives, isn't even constructed in that case).
     """
 
     def __init__(
@@ -870,7 +903,10 @@ class ReauthClient:
                                         "not due"/error answer with no
                                         signed payload
           2. explicit pin            -> REJECTED_PINNED_KEY
-          3. TOFU stored key         -> REJECTED_TOFU_KEY_CHANGED
+          3. TOFU stored key         -> REJECTED_TOFU_KEY_CHANGED, unless
+                                        the response carries a rotation
+                                        chain that verifies from the pinned
+                                        key to the presented one
           4. client challenge        -> REJECTED_CHALLENGE_MISMATCH
           5. seen server nonce       -> REJECTED_REPLAY (defence in depth)
           6. verify_fn over signed_message(payload) -> REJECTED_SIGNATURE
@@ -883,7 +919,9 @@ class ReauthClient:
         for the same reason the key checks are: a replayed response carries
         a perfectly valid signature, so crypto validity is the wrong question
         -- the question is "is this an answer to MY request". None of 2-6
-        mark the nonce as seen or persist a TOFU key.
+        mark the nonce as seen or persist a TOFU key, and an accepted
+        rotation chain is only persisted once 4-6 have passed under the new
+        key.
         """
         if not isinstance(response, dict) or response.get("v") != WIRE_VERSION:
             return self._unauthenticated(RequestOutcome.MALFORMED_RESPONSE, "not a wire-v2 response",
@@ -912,8 +950,11 @@ class ReauthClient:
             return self._reject(RequestOutcome.REJECTED_PINNED_KEY, *context, pinned_key_mismatch=True)
 
         first_contact = False
+        rotation = None  # a verified RotationCheck, persisted only if everything below passes
+        stored_key = stored_epoch = None
         if self._trust_store is not None:
             stored_key = self._trust_store.get_trusted_key(self._server_id)
+            stored_epoch = self._trust_store.get_epoch(self._server_id)
             if stored_key is None:
                 # First contact: the identity check passes trivially this
                 # once, but the challenge and verify_fn below still must.
@@ -922,7 +963,12 @@ class ReauthClient:
                 # store permanently (force_retrust() is never automatic).
                 first_contact = True
             elif stored_key != parsed.public_key:
-                return self._reject(RequestOutcome.REJECTED_TOFU_KEY_CHANGED, *context, trust_store_key_changed=True)
+                rotation = self._check_rotation(parsed, stored_key, stored_epoch)
+                if not rotation.accepted:
+                    # Unchanged TOFU key-change rejection; the reason the
+                    # chain failed (or "no rotation statement") is recorded.
+                    return self._reject(RequestOutcome.REJECTED_TOFU_KEY_CHANGED, *context,
+                                        trust_store_key_changed=True, rotation_rejected_reason=rotation.reason)
 
         if not hmac.compare_digest(parsed.client_challenge, expected_challenge):
             # Not an answer to this request: a recorded response from an
@@ -942,26 +988,78 @@ class ReauthClient:
         if not self._verify_fn(signed_message(parsed.payload), parsed.signature, parsed.public_key):
             return self._reject(RequestOutcome.REJECTED_SIGNATURE, *context)
 
-        self._seen_nonces[parsed.server_nonce] = now
+        trusted_epoch = stored_epoch
         if first_contact:
             # Only now -- challenge matched AND signature genuinely valid
             # under this key -- is it safe to learn it.
-            self._trust_store.trust_first_contact(self._server_id, parsed.public_key)
+            trusted_epoch = self._first_contact_epoch(parsed)
+            self._trust_store.trust_first_contact(self._server_id, parsed.public_key, epoch=trusted_epoch)
+        elif rotation is not None:
+            # Same deferral for a rotation: the chain verified from the old
+            # pin, and now this response has proven it answers MY challenge
+            # under the new key. accept_rotation() re-checks the pin and
+            # epoch against the file (compare-and-set).
+            try:
+                self._trust_store.accept_rotation(self._server_id, stored_key, parsed.public_key, rotation.new_epoch)
+            except TrustStoreError as exc:
+                return self._reject(RequestOutcome.REJECTED_TOFU_KEY_CHANGED, *context,
+                                    trust_store_key_changed=True, rotation_rejected_reason=str(exc))
+            trusted_epoch = rotation.new_epoch
+        self._seen_nonces[parsed.server_nonce] = now
         outcome = {
             "due": RequestOutcome.VERIFIED, "not_due": RequestOutcome.NOT_DUE, "error": RequestOutcome.SERVER_REFUSED,
         }[parsed.status]
-        seq = self._log_verification(outcome, *context, trusted=True)
+        rotation_fields = {}
+        if rotation is not None:
+            rotation_fields = dict(
+                key_rotation_accepted=True, rotation_statements=[link.to_wire() for link in rotation.links],
+                previous_public_key=stored_key, previous_epoch=stored_epoch, new_epoch=rotation.new_epoch,
+            )
+        seq = self._log_verification(outcome, *context, trusted=True, **rotation_fields)
         return ClientVerificationResult(
             due=parsed.status == "due", reason=parsed.reason, trusted=True, backend=parsed.backend,
             outcome=outcome, status=parsed.status, error_code=parsed.error_code, audit_seq=seq,
+            key_rotation_accepted=rotation is not None, trusted_epoch=trusted_epoch,
         )
 
-    def _reject(self, outcome, parsed, expected_challenge, slice_type, now, attempt, request_id, **flag):
+    def _rotations_of(self, parsed: _ParsedResponse) -> list[SignedRotation]:
+        if parsed.rotations is None:
+            return []
+        if not isinstance(parsed.rotations, list):
+            raise RotationFormatError("rotations is not a list")
+        return [SignedRotation.from_wire(item) for item in parsed.rotations]
+
+    def _check_rotation(self, parsed: _ParsedResponse, stored_key: bytes, stored_epoch: int):
+        try:
+            rotations = self._rotations_of(parsed)
+        except RotationFormatError as exc:
+            return RotationCheck(False, f"malformed rotations field: {exc}")
+        return verify_rotation_chain(
+            pinned_key=stored_key, pinned_epoch=stored_epoch, presented_key=parsed.public_key,
+            server_id=str(parsed.fields.get("server_id")), rotations=rotations, verify_fn=self._verify_fn,
+        )
+
+    def _first_contact_epoch(self, parsed: _ParsedResponse) -> int:
+        """The epoch to store with a first-contact key: the highest epoch
+        among attached statements endorsing that key, else 0. Exactly as
+        unverified as the first-contact key itself (TOFU); it matters only
+        so that a client first meeting a server that once rotated BACK to an
+        earlier key (e.g. restored from backup) doesn't start at epoch 0 and
+        accept a replay of an older statement from that same key."""
+        try:
+            statements = [r.statement for r in self._rotations_of(parsed)]
+        except RotationFormatError:
+            return 0
+        return max((st.epoch for st in statements if st.new_pubkey == parsed.public_key), default=0)
+
+    def _reject(self, outcome, parsed, expected_challenge, slice_type, now, attempt, request_id,
+                rotation_rejected_reason: str | None = None, **flag):
         seq = self._log_verification(outcome, parsed, expected_challenge, slice_type, now, attempt, request_id,
-                                     trusted=False, **flag)
+                                     trusted=False, rotation_rejected_reason=rotation_rejected_reason, **flag)
         return ClientVerificationResult(
             due=parsed.status == "due", reason=parsed.reason, trusted=False, backend=parsed.backend, outcome=outcome,
-            status=parsed.status, error_code=parsed.error_code, audit_seq=seq, **flag,
+            status=parsed.status, error_code=parsed.error_code, audit_seq=seq, detail=rotation_rejected_reason or "",
+            **flag,
         )
 
     def _unauthenticated(self, outcome, detail, slice_type, now, attempt, request_id, status=None):
@@ -1001,6 +1099,7 @@ class ReauthClient:
         pinned_key_mismatch: bool = False,
         trust_store_key_changed: bool = False,
         challenge_mismatch: bool = False,
+        **rotation_fields,
     ) -> int | None:
         if self.audit_logger is None:
             return None
@@ -1023,6 +1122,7 @@ class ReauthClient:
             now=now,
             attempt=attempt,
             request_id=request_id,
+            **rotation_fields,
         )
         return record["seq"]
 
@@ -1039,11 +1139,13 @@ class ReauthClient:
 def _serve_main(args: argparse.Namespace) -> int:
     from pqc_auth.dilithium import OqsDilithiumSigner
 
+    from pqc_auth.key_rotation import load_rotations
+
     signer = OqsDilithiumSigner(key_path=args.key_path)
     server = ReauthServer(
         DualTriggerReauthController(signer=signer), host=args.bind, port=args.port, served_log_path=args.audit_log,
         server_id=args.server_id, max_connections=args.max_connections, connection_timeout=args.connection_timeout,
-        max_connections_per_peer=args.max_connections_per_peer,
+        max_connections_per_peer=args.max_connections_per_peer, rotations=load_rotations(args.key_path),
     )
 
     stop = threading.Event()

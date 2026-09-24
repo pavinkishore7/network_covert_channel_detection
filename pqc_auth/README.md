@@ -285,14 +285,156 @@ a legitimate first connection, not against a hostile first connection.
 This is TOFU's own well-known limitation (SSH has the identical gap), not
 a shortcut taken in this implementation.
 
-**(c) No safe-rotation path:** a legitimate, intentional key rotation by
-the server looks **identical** to an attack under this scheme — both
-present a new key under an already-known `server_id`. Accepting either
-requires a human to call `TrustStore.force_retrust()` explicitly; nothing
-here tries to distinguish "this is probably a planned rotation" from "this
-is probably an attack," and no such heuristic is planned. Certificate
-authorities, revocation, and rotation-with-continuity are all explicitly
-out of scope for this project, not partially-solved.
+**(c) Rotation:** on its own, TOFU makes a legitimate key rotation look
+**identical** to an attack: both present a new key under a known
+`server_id`, and accepting either needs a human to call
+`TrustStore.force_retrust()`. Signed key rotation (next subsection) fixes
+this for planned rotations, and only for those: the old key signs the new
+one. A key change without a valid statement is still rejected exactly as
+before. There is no heuristic that guesses "probably a rotation".
+
+### Signed key rotation
+
+`pqc_auth/key_rotation.py`. Before the server retires a key, the
+**currently pinned key signs a statement endorsing the new key**. A TOFU
+client that trusts the old key verifies that signature itself and moves
+its pin to the new key. It keeps cryptographic continuity and needs no
+human.
+
+**Statement** (signed by the OLD key):
+
+| field | meaning |
+|---|---|
+| `server_id` | the identity the statement is for |
+| `old_pubkey_hash` | sha256 of the key being retired, which must be the client's current pin |
+| `new_pubkey` | the successor key |
+| `epoch` | integer, strictly increasing: 1 for the first rotation, 0 for a never-rotated key |
+| `issued_at` | integer unix seconds, informational only; acceptance never depends on clocks |
+
+**Serialization: length-prefixed binary, not JSON.** The signed bytes are a
+domain tag (`pqc_auth.key_rotation.v1\0`) followed by the fields in a fixed
+order:
+
+- each variable-length field is prefixed with its length as a 4-byte
+  big-endian integer;
+- `epoch` and `issued_at` are 8-byte big-endian integers.
+
+Why:
+
+- **Unambiguous.** Every field carries its length, so no two statements
+  share an encoding. The decoder rejects trailing bytes, truncation and a
+  wrong tag, so there is exactly one way to parse a statement.
+- **JSON can disagree with itself.** Parsers differ on duplicate keys, key
+  order, number formats (`1` / `1.0` / `1e0`), escaping and Unicode.
+  Statements are stored, forwarded and audited long after they are issued,
+  so the encoding should leave nothing to interpretation.
+- **Domain separation.** The domain tag differs from the re-auth payloads'
+  `SIGNATURE_DOMAIN`, so a signature over a re-auth answer can never be
+  passed off as a rotation statement, or the other way round.
+
+**Server side.** `python -m pqc_auth.key_rotation rotate --key-path DIR
+--server-id ID`, with the server stopped:
+
+1. It loads the current key and generates a new keypair.
+2. The old `OqsDilithiumSigner` signs the statement. liboqs keeps the
+   secret key inside the `Signature` object and `sign()` takes no key
+   argument, so the signer object itself is used.
+3. It replaces `secret_key.bin` / `public_key.bin` with the new keypair and
+   appends the statement to `rotations.json`, keeping the last 4.
+
+The old secret key exists only in memory for that one signature; its file
+is overwritten by the new key. Restart the server afterwards: `serve`
+loads `rotations.json` and attaches the statements to every signed
+response, as `"rotations"` next to `payload`. Each file is replaced
+atomically, but the three files are not replaced as one unit, so a crash
+mid-rotation needs an operator.
+
+**Client acceptance rules** (`ReauthClient.process_response()`, TOFU mode
+only). The response presents a key other than the pinned one:
+
+- **Accepted** when the attached statements form a chain that starts at the
+  pinned key and ends at the presented key. For every link:
+  - its `old_pubkey_hash` names the key trusted at that point;
+  - its signature verifies under that key;
+  - its epoch is above the previous one, starting above the stored epoch;
+  - it is for the `server_id` in the signed payload.
+
+  The new pin and epoch are persisted only after the response's own
+  challenge and signature checks pass under the new key, the same deferral
+  as first contact. `TrustStore.accept_rotation()` then re-checks, as a
+  compare-and-set against the file, that the pin is unchanged and the
+  epoch goes up.
+- **Rejected otherwise**, with the **unchanged** `REJECTED_TOFU_KEY_CHANGED`
+  outcome. That covers no statement, a bad signature, the wrong old key,
+  an epoch at or below the stored one, a broken or over-long chain, or a
+  chain ending at a different key. The reason is recorded in the result's
+  `detail` and in the audit record's `rotation_rejected_reason`.
+
+**Rollback protection is the epoch.** The client stores the epoch of its
+pinned key. A replayed old statement, or a retired key presented together
+with the statement that once endorsed it, carries an epoch at or below the
+stored one and is rejected. The case where the epoch is the *only* defence
+is a server that rotated K0 → K1 and later back to K0 (for example,
+restored from backup):
+
+- The old K0 → K1 statement really was signed by the current pin, K0.
+- An attacker holding the retired K1 secret replays it.
+- Only `epoch 1 <= 2` rejects it.
+
+`tests/test_key_rotation.py` tests this explicitly. On first contact the
+client also takes the epoch from any attached statement endorsing the
+presented key. That epoch is as unverified as the first-contact key
+itself.
+
+**Missed rotations: a verified chain is accepted, in order.** A client
+that was offline for several rotations checks the chain link by link, which
+is exactly what it would have checked if it had been online for each one.
+Accepting the chain therefore grants nothing a step-by-step client would
+not have granted.
+
+The alternative, rejecting and requiring manual re-trust, would put a human
+back in the loop for exactly the clients that miss rotations most, such as
+long-sleeping mMTC devices. The chain is capped at 4 links (`MAX_CHAIN_LINKS`)
+because each ML-DSA-65 link adds about 10.8 KB to every response. A client
+further behind than that gets the ordinary TOFU rejection and needs
+`force_retrust()`.
+
+**Precedence.** An explicit `expected_public_key` is never overridden by a
+rotation statement. The trust store, where rotation lives, is not even
+constructed when an explicit pin is given. This is the same precedence as
+before: a caller-asserted key wins outright.
+
+**Audit.** A record whose pin moved carries:
+
+- `key_rotation_accepted: true`;
+- the statements actually applied;
+- `previous_public_key`, `previous_epoch` and `new_epoch`.
+
+`audit_verify` decodes each statement with its own independent decoder. It
+re-verifies the chain link by link under `previous_public_key` and requires
+it to end at the record's `public_key` and `new_epoch`. A record claiming
+a rotation without such a chain FAILS: no statements, a statement signed by
+any other key, a stale epoch, or rotation fields without the claim.
+
+`audit_verify` does not check that `previous_public_key` really was the
+client's pin at the time. The trust store is not mirrored in the log:
+`force_retrust()` writes no record, and several clients may share one log.
+The reasoning is in `_check_rotation_accepted`.
+
+**What this does NOT do:**
+
+- **If the old private key is compromised, an attacker can issue a valid
+  rotation to their own key. This scheme has no revocation and does not
+  defend against that.** Recovery from a compromised old key is out of
+  scope.
+- **The first-contact TOFU limitation is unchanged.** Rotation only carries
+  trust forward from a key the client already pinned. If an attacker was
+  the first contact, rotation faithfully carries the attacker's trust
+  forward too.
+- **No certificate authorities and no revocation**: explicitly out of
+  scope, not partially solved.
+- A statement that was issued and leaked, for a rotation the operator then
+  abandoned, stays valid for any client still pinned to its old key.
 
 **`demo.py`** — `python -m pqc_auth.demo` (see below).
 
@@ -316,6 +458,11 @@ failed, when it isn't available:
   explicit-public-key verify path.
 - `tests/test_transport.py::DilithiumTransportTests` — the same transport
   round trip as the FakeSigner tests below, with a real signer.
+- `tests/test_key_rotation.py::PersistedOqsRotationTests` /
+  `CliRotationTests` — `rotate_persisted_key()` and the rotate-then-restart
+  CLI path with real ML-DSA-65 keys. The rotation rules themselves are
+  tested without liboqs in the same file, using FakeSigner over real
+  sockets.
 
 **Not gated, and must always pass without liboqs** (this is the point of
 `FakeSigner`): `tests/test_reauth_signer.py` (the `Signer`/`PublicKeyVerifier`
@@ -353,8 +500,18 @@ separate trust-on-first-use demonstration: a client with no prior
 knowledge of the server's key learns it on first contact, stays trusting
 across a second connection, rejects a simulated identity change under the
 same `server_id`, and accepts that new key only after an explicit
-re-trust call. The TOFU section resets its own trust-store file at the
-start of every run (unlike the persisted signer key / audit log) so first
+re-trust call. Then comes a signed key rotation, printed right after for
+contrast:
+
+- (a) the rotation is accepted automatically because the old key signed
+  the new one;
+- (b) a forged statement signed by an attacker's key is rejected;
+- a client that missed two rotations catches up through the verified chain;
+- (c) a rollback, meaning a retired key plus the old statement that
+  endorsed it, is rejected on its epoch.
+
+The TOFU and rotation sections reset their own trust-store files and
+rotation key directory at the start of every run (unlike the persisted signer key / audit log) so first
 contact is observable every time, not just the very first run ever. It
 auto-detects `oqs` and prints which signer backend it actually used; no
 setup is required either way.
@@ -424,7 +581,7 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   `public_key.bin` under that directory and reloads them on the next
   construction, so the same identity survives a process restart. This is
   PLAINTEXT ON DISK: no encryption at rest, no access control beyond OS
-  file permissions, and no rotation -- acceptable only for this project's
+  file permissions, and rotation only via `pqc_auth/key_rotation.py` -- acceptable only for this project's
   demo/review purposes, not a production key-management approach. Without
   `key_path` (the default), behavior is unchanged: a fresh in-memory-only
   keypair every construction. `FakeSigner`/`_DemoFakeSigner` were not
@@ -434,13 +591,13 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   identity surviving a restart; see the trust-on-first-use subsection
   above for the separate question of how a CLIENT that was never told the
   key in advance can arrive at one.
-- **No automatic key rotation policy.** A signer's key is fixed for its
-  lifetime; there is no rotation schedule and no way to signal "this
-  public key is no longer valid" to a client. `TrustStore.force_retrust()`
-  (see the trust-on-first-use subsection above) lets an operator
-  *manually* accept a new key for an already-known `server_id`, but there
-  is no automatic distinction between a legitimate rotation and an
-  attacker's key, and no revocation mechanism of any kind.
+- **Rotation is manual and signed; there is no schedule and no
+  revocation.** An operator runs `python -m pqc_auth.key_rotation rotate`
+  with the server stopped (see "Signed key rotation" above). TOFU clients
+  follow a signed rotation automatically. Nothing can signal "this public
+  key is no longer valid", and a compromised old key can sign a rotation
+  to an attacker's key. A key change without a statement still needs
+  `TrustStore.force_retrust()`.
 - **The transport defaults to localhost, and has been run across the
   real namespace topology**, with server and clients as separate processes
   in separate namespaces, via `python -m pqc_auth.transport serve|request`
@@ -468,4 +625,5 @@ Stated plainly, matching this project's own habit (`docs/DECISIONS.md`,
   `expected_public_key` only compares bytes the caller already has; it does
   not obtain them, verify a certificate chain, handle first-contact trust,
   or support rotating the pinned key without restarting the client with a
-  new value.
+  new value. Signed rotation deliberately moves only TOFU pins, never an
+  explicit one.

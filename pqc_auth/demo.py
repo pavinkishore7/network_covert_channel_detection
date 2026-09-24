@@ -17,6 +17,11 @@ walks through a few re-auth cycles, printing a readable trace:
      ITS OWN public key. The client rejects it purely because that public
      key isn't the pinned one -- distinct from steps 3's tamper/replay
      cases, which reject responses that DO carry the pinned key.
+  5. Trust-on-first-use: a changed key is rejected until a human re-trusts.
+  6. Signed key rotation, right after 5 for contrast: the old key signs a
+     statement endorsing the new one, and the client moves its pin on its
+     own -- while a forged statement and a replayed old statement (rollback)
+     are still rejected.
 
 The client in every scenario above is constructed with
 ``expected_public_key`` pinned to the real signer's own public key,
@@ -61,7 +66,18 @@ import hashlib
 import hmac
 from pathlib import Path
 
+import shutil
+
 from pqc_auth.audit_verify import format_report, verify_log
+from pqc_auth.key_rotation import (
+    RotationStatement,
+    SignedRotation,
+    encode_statement,
+    issue_rotation,
+    load_rotations,
+    pubkey_hash,
+    rotate_persisted_key,
+)
 from pqc_auth.reauth import DualTriggerReauthController
 from pqc_auth.transport import ReauthClient, ReauthServer, signed_message
 from pqc_auth.trust_store import TrustStore
@@ -75,6 +91,9 @@ DEMO_AUDIT_LOG_PATH = DEMO_STATE_DIR / "audit_log.jsonl"
 # otherwise only be observable the very first time this demo is ever run.
 DEMO_TOFU_TRUST_STORE_PATH = DEMO_STATE_DIR / "tofu_trust_store.json"
 DEMO_TOFU_SERVER_ID = "pqc_auth-demo-server"
+# Reset every run, like the TOFU store, so step 6 always starts at epoch 0.
+DEMO_ROTATION_DIR = DEMO_STATE_DIR / "rotation"
+DEMO_ROTATION_SERVER_ID = "pqc_auth-demo-rotating-server"
 
 
 class _DemoFakeSigner:
@@ -205,6 +224,106 @@ def _demo_tofu_pinning(server: ReauthServer, signer, verify_fn, backend_label: s
         changed_server.stop()
 
 
+class _RotatingServerKeys:
+    """The rotating server's key material for step 6, on either backend.
+    With oqs it is a real persisted key directory rotated by
+    key_rotation.rotate_persisted_key() (the same helper an operator uses);
+    with the HMAC stand-in it is a list of in-memory demo signers and
+    statements issued by key_rotation.issue_rotation()."""
+
+    def __init__(self, backend_label: str):
+        self.oqs = backend_label.startswith("OqsDilithiumSigner")
+        self.key_dir = DEMO_ROTATION_DIR / "server_key"
+        self._fake_signers = [_DemoFakeSigner(key=b"rotating-server-key-0")]
+        self._fake_rotations = []
+
+    def signer(self):
+        if self.oqs:
+            from pqc_auth.dilithium import OqsDilithiumSigner
+
+            return OqsDilithiumSigner(key_path=str(self.key_dir))
+        return self._fake_signers[-1]
+
+    def rotations(self):
+        return load_rotations(self.key_dir) if self.oqs else list(self._fake_rotations)
+
+    def rotate(self) -> int:
+        if self.oqs:
+            return rotate_persisted_key(self.key_dir, DEMO_ROTATION_SERVER_ID).statement.epoch
+        new = _DemoFakeSigner(key=f"rotating-server-key-{len(self._fake_signers)}".encode())
+        signed = issue_rotation(self._fake_signers[-1], new.public_key, DEMO_ROTATION_SERVER_ID,
+                                epoch=len(self._fake_rotations) + 1)
+        self._fake_signers.append(new)
+        self._fake_rotations.append(signed)
+        return signed.statement.epoch
+
+
+def _print_rotation(label: str, result) -> None:
+    line = (f"  [{label}] outcome={result.outcome.value} trusted={result.trusted} "
+            f"key_rotation_accepted={result.key_rotation_accepted}")
+    if result.trusted:
+        line += f" pinned_epoch={result.trusted_epoch}"
+    else:
+        line += f" (pin unchanged)\n  {'':{len(label) + 2}} reason: {result.detail}"
+    print(line)
+
+
+def _demo_signed_rotation(verify_fn, backend_label: str) -> None:
+    """Signed key rotation, shown right after step 5 so the difference is
+    readable: there a new key under a known server_id was rejected until an
+    operator called force_retrust(); here the OLD key has signed a statement
+    endorsing the new one, and the client checks that itself."""
+    print("\n6) Signed key rotation -- compare with step 5, where a changed key was rejected")
+    print("   until a human re-trusted it. Here the CURRENTLY pinned key signs a statement")
+    print("   endorsing its successor, so the client can follow the rotation on its own.")
+
+    if DEMO_ROTATION_DIR.exists():
+        shutil.rmtree(DEMO_ROTATION_DIR)
+    keys = _RotatingServerKeys(backend_label)
+    store_a = str(DEMO_ROTATION_DIR / "client_a_trust.json")
+    store_b = str(DEMO_ROTATION_DIR / "client_b_trust.json")
+    clock = iter(range(100, 10_000, 100))
+
+    def ask(store: str, signer, rotations):
+        server = ReauthServer(DualTriggerReauthController(signer=signer), server_id=DEMO_ROTATION_SERVER_ID,
+                              rotations=rotations)
+        server.start()
+        try:
+            client = ReauthClient(server.host, server.port, verify_fn=verify_fn, trust_store_path=store,
+                                  server_id=DEMO_ROTATION_SERVER_ID, audit_log_path=str(DEMO_AUDIT_LOG_PATH),
+                                  max_attempts=1)
+            return client.request_reauth("URLLC", next(clock), detector_alert=True)
+        finally:
+            server.stop()
+
+    _print_rotation("ROT client A first contact, key K0      ", ask(store_a, keys.signer(), keys.rotations()))
+    _print_rotation("ROT client B first contact, key K0      ", ask(store_b, keys.signer(), keys.rotations()))
+
+    print("\n   Server rotates K0 -> K1: K0 signs {server_id, sha256(K0), K1, epoch=1, issued_at}, then is retired.")
+    keys.rotate()
+    stolen_k1 = keys.signer()  # an attacker who will later steal K1, once it is retired
+    _print_rotation("(a) client A: K1 + statement signed by K0", ask(store_a, keys.signer(), keys.rotations()))
+
+    print("\n   Forged rotation: an attacker's own key X, with a statement naming K1 as the old key,")
+    print("   but signed by X (the attacker does not have K1's private key):")
+    attacker = _make_impersonator_signer(backend_label)
+    claim = encode_statement(RotationStatement(DEMO_ROTATION_SERVER_ID, pubkey_hash(keys.signer().public_key),
+                                               attacker.public_key, epoch=2, issued_at=0))
+    _print_rotation("(b) client A: key X + forged statement  ",
+                    ask(store_a, attacker, [SignedRotation(claim, attacker.sign(claim))]))
+
+    print("\n   Server rotates again K1 -> K2 (epoch 2). Client A follows one hop; client B, offline")
+    print("   since K0, catches up by verifying the chain K0->K1->K2 in order:")
+    keys.rotate()
+    _print_rotation("client A: K2 + chain                    ", ask(store_a, keys.signer(), keys.rotations()))
+    _print_rotation("client B: K2 + chain (missed 2 rotations)", ask(store_b, keys.signer(), keys.rotations()))
+
+    print("\n   Rollback: the attacker stole the RETIRED key K1 and replays the genuine epoch-1")
+    print("   statement that once endorsed it (validly signed by K0):")
+    old_statement = keys.rotations()[:1]
+    _print_rotation("(c) client A: retired K1 + old statement", ask(store_a, stolen_k1, old_statement))
+
+
 def main() -> None:
     signer, verify_fn, backend_label = _make_signer()
     print(f"pqc_auth demo -- signer backend: {backend_label}\n")
@@ -275,6 +394,7 @@ def main() -> None:
         _print_result("eMBB  t=20 impersonator's key ", client.process_response(impersonated, now=20, expected_challenge=challenge))
 
         _demo_tofu_pinning(server, signer, verify_fn, backend_label)
+        _demo_signed_rotation(verify_fn, backend_label)
     finally:
         server.stop()
 

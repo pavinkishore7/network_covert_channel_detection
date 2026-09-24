@@ -59,6 +59,12 @@ Three independent checks per record:
        not claim trust or signed material; ``policy_decision`` records must
        be re-derivable from the earlier outcome records they cite. See
        ``_check_record`` and the functions it dispatches to.
+     - A signed key rotation (``key_rotation_accepted`` true): on top of
+       the ordinary checks for a trusted record, every applied rotation
+       statement is decoded and re-verified as a chain from the recorded
+       ``previous_public_key`` to the record's ``public_key``. A record
+       claiming a rotation without such a chain FAILS. See
+       ``_check_rotation_accepted``.
 """
 
 from __future__ import annotations
@@ -66,6 +72,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +98,13 @@ _HMAC_BACKED_BACKENDS = {"FakeSigner", "_DemoFakeSigner", "_DemoLoopSigner"}
 # everything else in this module. tests/test_transport_binding.py asserts
 # the two literals stay equal.
 _SIGNATURE_DOMAIN_V2 = b"pqc_auth.reauth.v2\x00"
+
+
+# pqc_auth/key_rotation.py's ROTATION_DOMAIN, repeated for the same reason;
+# tests/test_key_rotation.py asserts the two stay equal. The statement
+# decoder below is likewise an independent reimplementation of
+# key_rotation.decode_statement.
+_ROTATION_DOMAIN = b"pqc_auth.key_rotation.v1\x00"
 
 
 # pqc_auth/outcomes.py's RequestOutcome values and their categories,
@@ -125,6 +139,127 @@ _REJECTION_FLAGS = ("rejected_as_replay", "challenge_mismatch", "pinned_key_mism
 
 def _canonical_json(fields: dict) -> str:
     return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
+def _crypto_valid(backend: str, message: bytes, signature: bytes, public_key: bytes) -> bool:
+    if backend in _HMAC_BACKED_BACKENDS:
+        # Independent reimplementation of the shared HMAC-SHA256
+        # scheme -- deliberately not imported from any of the classes
+        # that implement it (see _HMAC_BACKED_BACKENDS above).
+        expected = hmac.new(public_key, message, hashlib.sha256).digest()
+        return hmac.compare_digest(expected, signature)
+    return bool(verify_with_public_key(message, signature, public_key))
+
+
+def _decode_rotation(data: bytes) -> dict:
+    """Parse a rotation statement's exact signed bytes (layout documented in
+    pqc_auth/key_rotation.py). Raises ValueError on anything malformed."""
+    if not data.startswith(_ROTATION_DOMAIN):
+        raise ValueError("wrong domain tag")
+    pos = len(_ROTATION_DOMAIN)
+    parts = []
+    for _ in range(3):
+        if len(data) < pos + 4:
+            raise ValueError("truncated")
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        pos += 4
+        if length == 0 or len(data) < pos + length:
+            raise ValueError("bad field length")
+        parts.append(data[pos:pos + length])
+        pos += length
+    if len(data) != pos + 16:
+        raise ValueError("wrong length after variable fields")
+    epoch, issued_at = struct.unpack(">QQ", data[pos:])
+    if len(parts[1]) != 32 or epoch == 0:
+        raise ValueError("bad old_pubkey_hash length or epoch 0")
+    return {"server_id": parts[0].decode("utf-8"), "old_pubkey_hash": parts[1], "new_pubkey": parts[2],
+            "epoch": epoch, "issued_at": issued_at}
+
+
+_ROTATION_FIELDS = ("rotation_statements", "previous_public_key", "previous_epoch", "new_epoch")
+
+
+def _check_rotation_accepted(record: dict) -> tuple[bool, str]:
+    """A record claiming ``key_rotation_accepted``.
+
+    Reasoning: the claim is "the client moved its pin from
+    ``previous_public_key`` to this record's ``public_key`` without a human,
+    because the old key endorsed the new one". Everything that claim rests
+    on is in the record, so all of it is re-checked here rather than taken
+    on trust:
+      1. it is an accepted, authenticated answer (trusted, an OK/refused
+         outcome, no rejection flag) -- a rotation is only ever applied
+         after the response itself verified under the new key; the
+         ordinary signature branch then confirms that verification;
+      2. there is at least one statement, epochs start above
+         ``previous_epoch`` and strictly increase, and the last equals
+         ``new_epoch``;
+      3. link by link, the statement names the key trusted at that point
+         (sha256 matches), its signature verifies UNDER THAT KEY, and it is
+         for the ``server_id`` in the record's signed payload;
+      4. the chain ends at the record's ``public_key``.
+    A record that says a rotation was accepted but whose statements are
+    missing, forged (signed by any other key), stale or broken therefore
+    FAILS. What is NOT checked: that ``previous_public_key`` was really the
+    client's pin at the time. The pin lives in the client's trust store,
+    which the log does not mirror (``force_retrust()`` writes no record, and
+    several clients may share one log), so a cross-record "previous trusted
+    key" check would false-FAIL legitimate logs. Tampering with the field
+    after the fact is what the hash chain (checks 1-2) catches.
+    """
+    if not record.get("trusted") or record.get("outcome") not in ("verified", "not_due", "server_refused", None):
+        return False, "key_rotation_accepted=True on a record that was not an accepted, authenticated answer"
+    if any(record.get(f) for f in _REJECTION_FLAGS):
+        return False, "key_rotation_accepted=True alongside a rejection flag"
+    statements = record.get("rotation_statements")
+    if not isinstance(statements, list) or not statements:
+        return False, "key_rotation_accepted=True but no rotation statement is recorded"
+    try:
+        current_key = bytes.fromhex(record["previous_public_key"])
+        current_epoch = int(record["previous_epoch"])
+        final_key = bytes.fromhex(record["public_key"])
+        server_id = json.loads(record["signed_payload"])["server_id"]
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"key_rotation_accepted record missing previous key/epoch or signed payload: {exc}"
+    backend = record.get("backend", "")
+    for index, item in enumerate(statements):
+        try:
+            encoded = bytes.fromhex(item["statement"])
+            signature = bytes.fromhex(item["signature"])
+            st = _decode_rotation(encoded)
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            return False, f"rotation statement #{index} is malformed: {exc}"
+        if st["server_id"] != server_id:
+            return False, f"rotation statement #{index} is for {st['server_id']!r}, payload server_id is {server_id!r}"
+        if st["epoch"] <= current_epoch:
+            return False, f"rotation statement #{index} epoch {st['epoch']} is not above {current_epoch}"
+        if st["old_pubkey_hash"] != hashlib.sha256(current_key).digest():
+            return False, f"rotation statement #{index} was not issued by the previously trusted key"
+        try:
+            valid = _crypto_valid(backend, encoded, signature, current_key)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"rotation statement #{index} verification raised {type(exc).__name__}: {exc}"
+        if not valid:
+            return False, f"rotation statement #{index} signature does not verify under the previously trusted key"
+        current_key, current_epoch = st["new_pubkey"], st["epoch"]
+    if current_key != final_key:
+        return False, "rotation chain does not end at the record's public_key"
+    if current_epoch != record.get("new_epoch"):
+        return False, f"record new_epoch={record.get('new_epoch')!r} but the chain ends at epoch {current_epoch}"
+    return True, ""
+
+
+def _check_rotation_fields(record: dict) -> tuple[bool, str]:
+    if record.get("key_rotation_accepted"):
+        return _check_rotation_accepted(record)
+    present = [f for f in _ROTATION_FIELDS if f in record]
+    if present or "key_rotation_accepted" in record:
+        # Only the writer's rotation path produces these, always together
+        # with key_rotation_accepted=True.
+        return False, f"rotation fields {present or ['key_rotation_accepted']} without key_rotation_accepted=True"
+    if "rotation_rejected_reason" in record and not record.get("trust_store_key_changed"):
+        return False, "rotation_rejected_reason on a record that is not a TOFU key-change rejection"
+    return True, ""
 
 
 def _check_signature(record: dict) -> tuple[bool, str]:
@@ -261,16 +396,8 @@ def _check_signature(record: dict) -> tuple[bool, str]:
             "client_challenge differs from the expected challenge"
         )
 
-    backend = record.get("backend", "")
     try:
-        if backend in _HMAC_BACKED_BACKENDS:
-            # Independent reimplementation of the shared HMAC-SHA256
-            # scheme -- deliberately not imported from any of the classes
-            # that implement it (see _HMAC_BACKED_BACKENDS above).
-            expected = hmac.new(public_key, message, hashlib.sha256).digest()
-            crypto_valid = hmac.compare_digest(expected, signature)
-        else:
-            crypto_valid = bool(verify_with_public_key(message, signature, public_key))
+        crypto_valid = _crypto_valid(record.get("backend", ""), message, signature, public_key)
     except Exception as exc:  # noqa: BLE001 - report any backend failure as a check failure
         return False, f"signature verification raised {type(exc).__name__}: {exc}"
 
@@ -467,6 +594,8 @@ def _check_record(record: dict, prior: dict[int, dict]) -> tuple[bool, str]:
     ok, reason = _check_signature(record)
     if ok and "outcome" in record:
         ok, reason = _check_verification_outcome(record)
+    if ok:
+        ok, reason = _check_rotation_fields(record)
     return ok, reason
 
 

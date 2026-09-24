@@ -119,7 +119,8 @@ class LoopbackProcessTests(unittest.TestCase):
         store = self.dir / "trust.json"
         code, (record,) = self._request("--slice-type", "mMTC", "--trust-store", str(store), "--server-id", "core", "--now", "9000")
         self.assertTrue(record["result"]["trusted"])
-        self.assertEqual(json.loads(store.read_text())["core"], (self.dir / "keys" / "public_key.bin").read_bytes().hex())
+        self.assertEqual(json.loads(store.read_text())["core"],
+                         {"public_key": (self.dir / "keys" / "public_key.bin").read_bytes().hex(), "epoch": 0})
 
     def test_malformed_request_does_not_stop_the_cli_server(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
