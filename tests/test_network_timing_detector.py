@@ -166,24 +166,31 @@ class PerSliceThresholdTests(unittest.TestCase):
         with self.assertRaisesRegex(SliceNotCalibratedError, "mMTC"):
             detector.anomaly_by_slice(gaps, gaps)
 
-    def test_clean_mmtc_judged_by_its_own_threshold_not_urllcs(self):
-        detector = TimingKSDetector(seed=5)
+    def test_single_threshold_over_flags_clean_mmtc_per_slice_does_not(self):
+        """The behavioural regression: 2 s windows, clean mMTC traffic only.
+        Old behaviour -- one detector calibrated on URLLC, its single
+        threshold applied to every slice -- flags clean mMTC far above the
+        nominal 5% (measured 19.6% here). Per-slice calibration stays near
+        nominal (measured 3.5%). Asserted as a margin, not exact values."""
+        n_windows = 1000
+        single = TimingKSDetector(seed=5)
+        single.calibrate(functools.partial(generate_inter_packet_gaps, "URLLC", self.WINDOW_PACKETS["URLLC"],
+                                           np.random.default_rng(10)), n_trials=1000)
+        per_slice = TimingKSDetector(seed=5)
         for slice_type, n in self.WINDOW_PACKETS.items():
             sampler = functools.partial(generate_inter_packet_gaps, slice_type, n, np.random.default_rng(10))
-            detector.calibrate(sampler, n_trials=500, slice_type=slice_type)
-        n = self.WINDOW_PACKETS["mMTC"]
-        baseline = {"mMTC": generate_inter_packet_gaps("mMTC", n, np.random.default_rng(20))}
-        windows = [generate_inter_packet_gaps("mMTC", n, np.random.default_rng(1000 + i)) for i in range(200)]
+            per_slice.calibrate(sampler, n_trials=1000, slice_type=slice_type)
 
-        per_slice = np.mean([detector.anomaly_by_slice({"mMTC": w}, baseline)["mMTC"] for w in windows])
-        # What the old code did: every slice judged by ONE threshold -- here
-        # URLLC's, as when the detector had been calibrated on URLLC only.
-        old_single_threshold = np.mean(
-            [detector.statistic(w, baseline["mMTC"]) > detector.thresholds_["URLLC"] for w in windows]
+        n = self.WINDOW_PACKETS["mMTC"]
+        baseline = generate_inter_packet_gaps("mMTC", n, np.random.default_rng(20))
+        windows = [generate_inter_packet_gaps("mMTC", n, np.random.default_rng(1000 + i)) for i in range(n_windows)]
+        far_single = np.mean([single.is_anomalous(w, baseline) for w in windows])
+        far_per_slice = np.mean(
+            [per_slice.anomaly_by_slice({"mMTC": w}, {"mMTC": baseline})["mMTC"] for w in windows]
         )
-        self.assertLessEqual(per_slice, 0.08)          # measured 0.03: about the calibrated 5%
-        self.assertGreaterEqual(old_single_threshold, 0.15)  # measured 0.20: clean mMTC mis-flagged
-        self.assertGreater(detector.thresholds_["mMTC"], detector.thresholds_["URLLC"])
+
+        self.assertLess(far_per_slice, 0.08)                  # near the calibrated 5%
+        self.assertGreater(far_single - far_per_slice, 0.08)  # single threshold clearly over-flags
 
     def test_equal_window_sizes_give_equal_thresholds(self):
         """Why the bug hid in the fixed-300-packet demo: the KS null is

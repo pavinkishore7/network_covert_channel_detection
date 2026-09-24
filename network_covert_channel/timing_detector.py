@@ -129,6 +129,11 @@ class TimingKSDetector:
         ``slice_type`` is given (the sampler must then draw that slice's
         clean gaps, at that slice's window size), else ``threshold_``.
 
+        The two-sample KS null distribution depends only on the sample
+        sizes, not on the gap distribution, so thresholds really differ by
+        packets per window; per-slice calibration is how that difference is
+        captured when windows are defined in time.
+
         ``clean_gap_sampler`` is a zero-arg callable returning a fresh,
         independent clean gap sample each call (e.g.
         ``functools.partial(generate_inter_packet_gaps, slice_type,
