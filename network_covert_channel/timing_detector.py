@@ -52,6 +52,20 @@ CONSTRUCTION -- report that alongside any detection-rate number, exactly
 as autoencoder_detector.py's calibrate() docstring insists for its own
 threshold.
 
+Per-slice thresholds: ``anomaly_by_slice`` judges every slice against a
+threshold calibrated on THAT slice's own clean gaps (``calibrate(...,
+slice_type=...)``), and raises ``SliceNotCalibratedError`` for a slice that
+was never calibrated -- it never falls back to another slice's threshold.
+Why this matters even though the two-sample KS null is distribution-free
+(for continuous data it depends only on the two sample sizes, not on the
+gap distribution): slices run at different packet rates, so a window
+defined in TIME holds a different number of packets per slice, and the
+null threshold moves a lot with sample size (95th percentile D ~= 0.137 at
+300 packets vs ~= 0.320 at 50). A threshold calibrated at one slice's
+window size is simply wrong for another's. With identical packet counts
+per window the per-slice thresholds coincide, which is why the single
+shared threshold went unnoticed in the fixed-300-packet demo.
+
 Output shape: ``anomaly_by_slice`` returns ``dict[str, bool]`` --
 deliberately the exact type ``pqc_auth.orchestration
 .drive_reauth_from_detector_flags`` already accepts as its
@@ -72,6 +86,11 @@ import numpy as np
 from scipy.stats import ks_2samp
 
 
+class SliceNotCalibratedError(RuntimeError):
+    """anomaly_by_slice / is_anomalous(slice_type=...) was asked about a
+    slice that has no threshold of its own."""
+
+
 @dataclass(frozen=True)
 class KSDetectionResult:
     statistic: float
@@ -85,7 +104,12 @@ class TimingKSDetector:
 
     def __init__(self, seed: int | None = None):
         self.rng = np.random.default_rng(seed)
+        # Single-slice use: calibrate() without slice_type, then
+        # is_anomalous()/score() without slice_type.
         self.threshold_: float | None = None
+        # Per-slice thresholds: calibrate(..., slice_type=s). The only
+        # thresholds anomaly_by_slice() ever reads.
+        self.thresholds_: dict[str, float] = {}
 
     def statistic(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> float:
         """The KS D statistic (max absolute gap between the two empirical
@@ -98,9 +122,12 @@ class TimingKSDetector:
         clean_gap_sampler: Callable[[], np.ndarray],
         n_trials: int = 200,
         percentile: float = 95.0,
+        slice_type: str | None = None,
     ) -> float:
-        """Sets threshold_ from the tail of the CLEAN-vs-CLEAN null
-        distribution of the KS D statistic.
+        """Sets a threshold from the tail of the CLEAN-vs-CLEAN null
+        distribution of the KS D statistic: ``thresholds_[slice_type]`` when
+        ``slice_type`` is given (the sampler must then draw that slice's
+        clean gaps, at that slice's window size), else ``threshold_``.
 
         ``clean_gap_sampler`` is a zero-arg callable returning a fresh,
         independent clean gap sample each call (e.g.
@@ -117,19 +144,37 @@ class TimingKSDetector:
             a = clean_gap_sampler()
             b = clean_gap_sampler()
             null_stats[i] = self.statistic(a, b)
-        self.threshold_ = float(np.percentile(null_stats, percentile))
-        return self.threshold_
+        threshold = float(np.percentile(null_stats, percentile))
+        if slice_type is None:
+            self.threshold_ = threshold
+        else:
+            self.thresholds_[slice_type] = threshold
+        return threshold
 
-    def is_anomalous(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> bool:
-        if self.threshold_ is None:
-            raise RuntimeError("Call calibrate() before is_anomalous().")
-        return self.statistic(observed_gaps, baseline_gaps) > self.threshold_
+    def threshold_for(self, slice_type: str | None) -> float:
+        """The threshold to judge ``slice_type`` by (``threshold_`` when
+        ``slice_type`` is None). Never substitutes another slice's."""
+        if slice_type is None:
+            if self.threshold_ is None:
+                raise RuntimeError("Call calibrate() before scoring.")
+            return self.threshold_
+        if slice_type not in self.thresholds_:
+            raise SliceNotCalibratedError(
+                f"no threshold calibrated for slice {slice_type!r} (calibrated: {sorted(self.thresholds_)}); "
+                f"call calibrate(..., slice_type={slice_type!r}) on that slice's own clean gaps"
+            )
+        return self.thresholds_[slice_type]
 
-    def score(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray) -> KSDetectionResult:
+    def is_anomalous(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray,
+                     slice_type: str | None = None) -> bool:
+        threshold = self.threshold_for(slice_type)
+        return self.statistic(observed_gaps, baseline_gaps) > threshold
+
+    def score(self, observed_gaps: np.ndarray, baseline_gaps: np.ndarray,
+              slice_type: str | None = None) -> KSDetectionResult:
+        threshold = self.threshold_for(slice_type)
         stat = self.statistic(observed_gaps, baseline_gaps)
-        if self.threshold_ is None:
-            raise RuntimeError("Call calibrate() before score().")
-        return KSDetectionResult(statistic=stat, anomaly=stat > self.threshold_)
+        return KSDetectionResult(statistic=stat, anomaly=stat > threshold)
 
     def anomaly_by_slice(
         self,
@@ -140,8 +185,11 @@ class TimingKSDetector:
         directly compatible with
         ``pqc_auth.orchestration.drive_reauth_from_detector_flags``'s
         ``anomaly_by_slice`` parameter (not wired in here, see module
-        docstring)."""
+        docstring). Each slice is judged by its OWN calibrated threshold;
+        an uncalibrated slice raises SliceNotCalibratedError."""
         return {
-            slice_type: self.is_anomalous(observed_gaps_by_slice[slice_type], baseline_gaps_by_slice[slice_type])
+            slice_type: self.is_anomalous(
+                observed_gaps_by_slice[slice_type], baseline_gaps_by_slice[slice_type], slice_type=slice_type
+            )
             for slice_type in observed_gaps_by_slice
         }

@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from network_covert_channel.covert_injector import CovertInjectorConfig, NonAdaptiveCovertInjector
-from network_covert_channel.timing_detector import KSDetectionResult, TimingKSDetector
+from network_covert_channel.timing_detector import KSDetectionResult, SliceNotCalibratedError, TimingKSDetector
 from network_covert_channel.traffic import generate_inter_packet_gaps
 from slicing_sim.ofdm_grid import SLICE_TYPES
 
@@ -30,6 +30,17 @@ def _calibrated_detector(slice_type: str, seed: int) -> TimingKSDetector:
     calib_rng = np.random.default_rng(seed + 1)
     sampler = functools.partial(generate_inter_packet_gaps, slice_type, N_PACKETS, calib_rng)
     detector.calibrate(sampler, n_trials=100, percentile=95.0)
+    return detector
+
+
+def _per_slice_detector(seed: int, n_by_slice: dict[str, int] | None = None, n_trials: int = 100) -> TimingKSDetector:
+    """One detector, calibrated separately on each slice's own clean gaps
+    (at that slice's own window size)."""
+    n_by_slice = n_by_slice or {s: N_PACKETS for s in SLICE_TYPES}
+    detector = TimingKSDetector(seed=seed)
+    for slice_type, n in n_by_slice.items():
+        sampler = functools.partial(generate_inter_packet_gaps, slice_type, n, np.random.default_rng(seed + 1))
+        detector.calibrate(sampler, n_trials=n_trials, percentile=95.0, slice_type=slice_type)
     return detector
 
 
@@ -116,15 +127,13 @@ class DetectionAccuracyTests(unittest.TestCase):
 
 class AnomalyBySliceShapeTests(unittest.TestCase):
     def test_anomaly_by_slice_returns_a_bool_keyed_by_slice_type(self):
-        detectors = {s: _calibrated_detector(s, seed=99) for s in SLICE_TYPES}
         baseline = {
             s: generate_inter_packet_gaps(s, N_PACKETS, np.random.default_rng(1)) for s in SLICE_TYPES
         }
         observed = {
             s: generate_inter_packet_gaps(s, N_PACKETS, np.random.default_rng(2)) for s in SLICE_TYPES
         }
-        detector = detectors["URLLC"]
-        flags = detector.anomaly_by_slice(observed, baseline)
+        flags = _per_slice_detector(seed=99).anomaly_by_slice(observed, baseline)
         self.assertEqual(set(flags.keys()), set(SLICE_TYPES))
         for value in flags.values():
             self.assertIsInstance(value, bool)
@@ -138,6 +147,53 @@ class AnomalyBySliceShapeTests(unittest.TestCase):
         self.assertIsInstance(result.anomaly, bool)
 
 
+class PerSliceThresholdTests(unittest.TestCase):
+    """anomaly_by_slice judges each slice by the threshold calibrated on
+    that slice's own clean gaps, and never borrows another slice's."""
+
+    # Packets per 2-second window at each slice's measured packet rate
+    # (70.7 pkt/s URLLC, 37.6 pkt/s mMTC; see network_covert_channel/README.md).
+    # Time-based windows are where per-slice thresholds matter: the KS null
+    # depends on sample size, so a threshold calibrated at URLLC's window
+    # size is too low for mMTC's smaller one.
+    WINDOW_PACKETS = {"URLLC": 141, "mMTC": 75}
+
+    def test_an_uncalibrated_slice_raises_instead_of_borrowing_a_threshold(self):
+        detector = _per_slice_detector(seed=3, n_by_slice={"URLLC": N_PACKETS})
+        detector.calibrate(functools.partial(generate_inter_packet_gaps, "URLLC", N_PACKETS,
+                                             np.random.default_rng(4)), n_trials=50)  # a single-slice threshold_ too
+        gaps = {s: generate_inter_packet_gaps(s, N_PACKETS, np.random.default_rng(5)) for s in ("URLLC", "mMTC")}
+        with self.assertRaisesRegex(SliceNotCalibratedError, "mMTC"):
+            detector.anomaly_by_slice(gaps, gaps)
+
+    def test_clean_mmtc_judged_by_its_own_threshold_not_urllcs(self):
+        detector = TimingKSDetector(seed=5)
+        for slice_type, n in self.WINDOW_PACKETS.items():
+            sampler = functools.partial(generate_inter_packet_gaps, slice_type, n, np.random.default_rng(10))
+            detector.calibrate(sampler, n_trials=500, slice_type=slice_type)
+        n = self.WINDOW_PACKETS["mMTC"]
+        baseline = {"mMTC": generate_inter_packet_gaps("mMTC", n, np.random.default_rng(20))}
+        windows = [generate_inter_packet_gaps("mMTC", n, np.random.default_rng(1000 + i)) for i in range(200)]
+
+        per_slice = np.mean([detector.anomaly_by_slice({"mMTC": w}, baseline)["mMTC"] for w in windows])
+        # What the old code did: every slice judged by ONE threshold -- here
+        # URLLC's, as when the detector had been calibrated on URLLC only.
+        old_single_threshold = np.mean(
+            [detector.statistic(w, baseline["mMTC"]) > detector.thresholds_["URLLC"] for w in windows]
+        )
+        self.assertLessEqual(per_slice, 0.08)          # measured 0.03: about the calibrated 5%
+        self.assertGreaterEqual(old_single_threshold, 0.15)  # measured 0.20: clean mMTC mis-flagged
+        self.assertGreater(detector.thresholds_["mMTC"], detector.thresholds_["URLLC"])
+
+    def test_equal_window_sizes_give_equal_thresholds(self):
+        """Why the bug hid in the fixed-300-packet demo: the KS null is
+        distribution-free, so equal sample sizes give the same threshold on
+        every slice up to Monte Carlo noise -- within one step of D (1/n),
+        even though the slices' gap distributions differ greatly."""
+        thresholds = _per_slice_detector(seed=7, n_trials=300).thresholds_.values()
+        self.assertLessEqual(max(thresholds) - min(thresholds), 1.0 / N_PACKETS + 1e-9)
+
+
 class OrchestrationCompatibilityTests(unittest.TestCase):
     """Verifies (does not wire in) that anomaly_by_slice's dict[str, bool]
     output is accepted as-is by
@@ -149,7 +205,7 @@ class OrchestrationCompatibilityTests(unittest.TestCase):
         from pqc_auth.orchestration import drive_reauth_from_detector_flags
         from pqc_auth.reauth import DualTriggerReauthController
 
-        detector = _calibrated_detector("URLLC", seed=123)
+        detector = _per_slice_detector(seed=123)
         baseline = {s: generate_inter_packet_gaps(s, N_PACKETS, np.random.default_rng(1)) for s in SLICE_TYPES}
         observed = {s: generate_inter_packet_gaps(s, N_PACKETS, np.random.default_rng(2)) for s in SLICE_TYPES}
         flags = detector.anomaly_by_slice(observed, baseline)
